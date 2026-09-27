@@ -16,7 +16,10 @@ dp1/dp4/dp5/dp6/dp7/dp9 ← dp8
 dp9 ← dp5, dp8
 ```
 
-## dp1 湖底座 LakeStore
+## dp1
+
+目录: app/data_plane/dp1.py
+- 模块: （无——最底层）
 
 - **职责**：对象存储 + Iceberg 表的统一读写门面，屏蔽 catalog/存储/表格式差异。
 - **公开接口**（逐字，真实化补充项标 🆕）：
@@ -31,7 +34,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`Catalog`/`TableRef` 抽象；测试替身 `InMemoryLake`、`FakeCatalog`
 - **测试计划**：DP-W-D1-1…4（schema 四件齐/快照隔离/谓词列裁剪/写面越界审计）
 
-## dp2 进料 Ingest
+## dp2
+
+目录: app/data_plane/dp2.py
+- 模块: `dp1`
 
 - **职责**：把上游数据（fieldforge 产物 / 班报批量）写入湖表，登记并暴露新鲜度档位元数据。
 - **公开接口**：
@@ -43,7 +49,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`FreshnessRegistry`；测试替身 `StaticFreshness`
 - **测试计划**：DP-W-D2-1…4；进料源=fieldforge run 目录（manifest→freshness 登记）
 
-## dp3 加工与质量 Transform
+## dp3
+
+目录: app/data_plane/dp3.py
+- 模块: `dp1`
 
 - **职责**：质量规则执行（20 条）、staging→intermediate→marts 分层、口径与血缘清单。
 - **公开接口**：
@@ -55,7 +64,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`Runner`；测试替身 `FakeDbt`（S1 不引入 dbt）
 - **测试计划**：DP-W-D3-1…4；20 条规则对象（1–12 原文 + 13–20 重建）；fieldforge 脏配方=挂样本源
 
-## dp4 语义层 Semantic
+## dp4
+
+目录: app/data_plane/dp4.py
+- 模块: `dp3`
 
 - **职责**：15 条指标卡 → 机器可读口径；术语归一（block/rewrite/pass）是问数入口第一闸。
 - **公开接口**：
@@ -67,7 +79,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`DictionaryBackend`；S1=`StaticYaml`
 - **测试计划**：DP-W-D4-1…5；词表四类逐字（设定书 §6）
 
-## dp5 执行适配 QueryRunner
+## dp5
+
+目录: app/data_plane/dp5.py
+- 模块: `dp1`, `dp4`, `dp9`
 
 - **职责**：同一 StructuredQuery 按档位路由引擎执行，返回 Arrow + 快照号 + 统计。
 - **公开接口**：
@@ -78,7 +93,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`EngineAdapter`（duckdb 实现；trino/starrocks 留位）；测试替身 `RecordedEngine`
 - **测试计划**：DP-W-D5-1…4；StructuredQuery 含 base_table/limit 槽位（裁决 #10）
 
-## dp6 新鲜度路由 FreshnessRouter
+## dp6
+
+目录: app/data_plane/dp6.py
+- 模块: `dp2`, `dp4`
 
 - **职责**：问题时间窗 × 表新鲜度档位 → 三出口（答实时面/答离线面/拒答并诚实声明）。
 - **公开接口**：
@@ -88,7 +106,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`Clock`；测试替身 `FakeClock`
 - **测试计划**：DP-W-D6-1…3；TimeWindow={start,end,granularity}（裁决 #11）
 
-## dp7 快照审计 Audit
+## dp7
+
+目录: app/data_plane/dp7.py
+- 模块: `dp1`, `dp5`
 
 - **职责**：结论绑定快照四元组，同快照回放校验，保留窗口。
 - **公开接口**：
@@ -99,7 +120,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`AuditStore`；测试替身 `InMemoryAudit`
 - **测试计划**：DP-W-D7-1…3
 
-## dp8 数据工具面 DataTools（五只读工具，JSON 合同）
+## dp8
+
+目录: app/data_plane/dp8.py
+- 模块: `dp1`, `dp4`, `dp5`, `dp6`, `dp7`, `dp9`
 
 - **职责**：问数 Agent 与数据面的**唯一接缝**：发现→描述→查询→回放→溯源。
 - **公开接口**：
@@ -113,7 +137,10 @@ dp9 ← dp5, dp8
 - **Seam/Adapter**：`ToolTransport`（S1=in_process；S2+=MCP 留位）
 - **测试计划**：DP-W-D8-1…4
 
-## dp9 治理控制面 Governance
+## dp9
+
+目录: app/data_plane/dp9.py
+- 模块: （无——最底层）
 
 - **职责**：横切闸——合法 join 白名单（默认拒绝）、行级作业区隔离、导出审批（S1 降级不可用）、S3 凭证下发（形状留位）。
 - **公开接口**：

@@ -1,6 +1,34 @@
 # spec —— S1 垂直切片：老王问数 tracer bullet
 
-状态: 已定稿 · 2026-09-27 · 触及模块: dp1/dp2/dp3/dp4/dp5/dp6/dp7/dp8/dp9（全部九卡，S1 范围）
+状态: 已定稿
+
+## 触及的模块
+
+| 模块 | S1 实装 | 留位 |
+|---|---|---|
+| dp1 | PyIceberg SqlCatalog（JDBC→postgres）+ MinIO | rest/federated |
+| dp2 | run_batch_load + register_freshness/freshness | cdc 实装 |
+| dp3 | 质量闸框架 + 规则 1/2/3/5 | 规则 4/6-12 精化、13–20 重建 |
+| dp4 | StaticYaml 15 指标卡 + resolve_term + build_query + authoritative_source | Cube |
+| dp5 | DuckDB EngineAdapter + 成本护栏 | trino/starrocks |
+| dp6 | route 三查三出口 + refusal_text | S3 跨域 |
+| dp7 | record/replay/retention（InMemoryAudit） | S2 对账作业 |
+| dp8 | 五工具 in_process + 只读红线机查 | MCP server |
+| dp9 | check_join + authorize + export 降级隐藏 + vending 形状 | 策略引擎 |
+
+## 验收测试
+
+| # | 验收 | 对应断言/测试 |
+|---|---|---|
+| A1 | 进料：脏批被质检拦截，净批入湖后 freshness=offline、provenance 在案 | `tests/dp3/test_quality_gate.py + tests/dp2/test_ingest.py` |
+| A2 | 湖表：schema 四件齐；快照隔离；谓词+列裁剪 | `tests/dp1/test_lake_store.py` |
+| A3 | 语义：catalog 15 条；block/rewrite/消歧 | `tests/dp4/test_semantic.py` |
+| A4 | 治理：✗ 边拒；跨作业区读拒 | `tests/dp9/test_governance.py` |
+| A5 | 路由：粒度冲突拒答话术；历史窗答离线面 | `tests/dp6/test_freshness_router.py` |
+| A6 | 执行：快照透传；成本护栏 | `tests/dp5/test_query_runner.py` |
+| A7 | 审计：四元组/回放 match/过期显式报错 | `tests/dp7/test_audit.py` |
+| A8 | 工具面：只读红线 write_surface=0；四道闸任一拒即整体拒 | `tests/dp8/test_tools.py` |
+| A9 | 端到端：老王问数全链路（真实 fieldforge 产物进料→query→AnswerBundle） | `tests/e2e/test_tracer_bullet.py` |
 
 ## 1. 目标
 
@@ -26,15 +54,15 @@
 
 | # | 验收 | 对应断言/测试 |
 |---|---|---|
-| A1 | 进料：脏批（班报重复行）被质检拦截，净批入湖后 freshness=offline、provenance 在案 | DP-W-D2-1；tests/dp3+dp2 |
-| A2 | 湖表：schema 四件齐；两次 append 后旧快照可读（隔离）；谓词+列裁剪 | DP-W-D1-1/2/3 |
-| A3 | 语义：metric_catalog 15 条；"老完成率"block；"剔检产量"rewrite；"有效产量"无修饰词→消歧询问 | DP-W-D4-1/2/3/4 |
-| A4 | 治理：oil_production_daily⋈fluid_test 直连拒；渤中用户查渤南井拒 | DP-W-D9-1/2 |
-| A5 | 路由：月度指标×"今天上午"拒答且话术含"数据截至"；历史窗答离线面 | DP-W-D6-1/2 + 分支 C |
-| A6 | 执行：snapshot_id 透传；超成本护栏拒绝/降级显式声明 | DP-W-D5-3/4 |
-| A7 | 审计：record 四元组齐；同快照 replay match=True；快照过期显式报错 | DP-W-D7-1/2/3 |
-| A8 | 工具面：五工具 JSON 合同 + 只读红线机查 write_surface=0 + query 四道闸任一拒即整体拒 | DP-W-D8-1/2/3 |
-| A9 | **端到端**：老王问数 tracer bullet 全链路一条测试走通（真实 fieldforge 产物进料 → query → AnswerBundle） | 本 spec §1 |
+| A1 | 进料：脏批（班报重复行）被质检拦截，净批入湖后 freshness=offline、provenance 在案 | `tests/dp3/test_quality_gate.py + tests/dp2/test_ingest.py` |
+| A2 | 湖表：schema 四件齐；两次 append 后旧快照可读（隔离）；谓词+列裁剪 | `tests/dp1/test_lake_store.py` |
+| A3 | 语义：metric_catalog 15 条；"老完成率"block；"剔检产量"rewrite；"有效产量"无修饰词→消歧询问 | `tests/dp4/test_semantic.py` |
+| A4 | 治理：oil_production_daily⋈fluid_test 直连拒；渤中用户查渤南井拒 | `tests/dp9/test_governance.py` |
+| A5 | 路由：月度指标×"今天上午"拒答且话术含"数据截至"；历史窗答离线面 | `tests/dp6/test_freshness_router.py` |
+| A6 | 执行：snapshot_id 透传；超成本护栏拒绝/降级显式声明 | `tests/dp5/test_query_runner.py` |
+| A7 | 审计：record 四元组齐；同快照 replay match=True；快照过期显式报错 | `tests/dp7/test_audit.py` |
+| A8 | 工具面：五工具 JSON 合同 + 只读红线机查 write_surface=0 + query 四道闸任一拒即整体拒 | `tests/dp8/test_tools.py` |
+| A9 | **端到端**：老王问数 tracer bullet 全链路一条测试走通（真实 fieldforge 产物进料 → query → AnswerBundle） | `tests/e2e/test_tracer_bullet.py` |
 
 ## 4. 供给依赖
 
