@@ -18,7 +18,7 @@ dp9 ← dp5, dp8
 
 ## dp1
 
-目录: app/data_plane/dp1.py
+目录: app/data_plane
 - 模块: （无——最底层）
 
 - **职责**：对象存储 + Iceberg 表的统一读写门面，屏蔽 catalog/存储/表格式差异。
@@ -36,7 +36,7 @@ dp9 ← dp5, dp8
 
 ## dp2
 
-目录: app/data_plane/dp2.py
+目录: app/data_plane
 - 模块: `dp1`
 
 - **职责**：把上游数据（fieldforge 产物 / 班报批量）写入湖表，登记并暴露新鲜度档位元数据。
@@ -51,7 +51,7 @@ dp9 ← dp5, dp8
 
 ## dp3
 
-目录: app/data_plane/dp3.py
+目录: app/data_plane
 - 模块: `dp1`
 
 - **职责**：质量规则执行（20 条）、staging→intermediate→marts 分层、口径与血缘清单。
@@ -66,7 +66,7 @@ dp9 ← dp5, dp8
 
 ## dp4
 
-目录: app/data_plane/dp4.py
+目录: app/data_plane
 - 模块: `dp3`
 
 - **职责**：15 条指标卡 → 机器可读口径；术语归一（block/rewrite/pass）是问数入口第一闸。
@@ -81,7 +81,7 @@ dp9 ← dp5, dp8
 
 ## dp5
 
-目录: app/data_plane/dp5.py
+目录: app/data_plane
 - 模块: `dp1`, `dp4`, `dp9`
 
 - **职责**：同一 StructuredQuery 按档位路由引擎执行，返回 Arrow + 快照号 + 统计。
@@ -95,7 +95,7 @@ dp9 ← dp5, dp8
 
 ## dp6
 
-目录: app/data_plane/dp6.py
+目录: app/data_plane
 - 模块: `dp2`, `dp4`
 
 - **职责**：问题时间窗 × 表新鲜度档位 → 三出口（答实时面/答离线面/拒答并诚实声明）。
@@ -108,7 +108,7 @@ dp9 ← dp5, dp8
 
 ## dp7
 
-目录: app/data_plane/dp7.py
+目录: app/data_plane
 - 模块: `dp1`, `dp5`
 
 - **职责**：结论绑定快照四元组，同快照回放校验，保留窗口。
@@ -122,7 +122,7 @@ dp9 ← dp5, dp8
 
 ## dp8
 
-目录: app/data_plane/dp8.py
+目录: app/data_plane
 - 模块: `dp1`, `dp4`, `dp5`, `dp6`, `dp7`, `dp9`
 
 - **职责**：问数 Agent 与数据面的**唯一接缝**：发现→描述→查询→回放→溯源。
@@ -139,7 +139,7 @@ dp9 ← dp5, dp8
 
 ## dp9
 
-目录: app/data_plane/dp9.py
+目录: app/data_plane
 - 模块: （无——最底层）
 
 - **职责**：横切闸——合法 join 白名单（默认拒绝）、行级作业区隔离、导出审批（S1 降级不可用）、S3 凭证下发（形状留位）。
