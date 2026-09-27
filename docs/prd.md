@@ -1,8 +1,8 @@
 # PRD —— tpa-data-plane（Petro-Agent 数据面真实代码）
 
-状态: 逼问中
+状态: 已定稿
 
-> **版本** v0.1 · **日期** 2026-09-27
+> **版本** v0.2 · **日期** 2026-09-27（v0.1 粗稿 + 阶段 1 逼问五项拍板 + 11 维闭单 → 定稿）
 > **蓝本**：teach-petro-agent 教学仓（dp 卡 292 行已定稿 / 35 条 W-DP 断言 / 20 条质量规则 / 15 条指标卡 / DP1–DP9 九份底稿）。抽取素材报告见会话归档（A–F 六节，F 节=24 项教学演绎差距）。
 > **供给方**：fieldforge（已完成，云端 8.163.33.135 可产合同全量数据）
 > **流程**：sdd-flow（教学环节裁剪，本地施工票）
@@ -131,7 +131,7 @@ Python 3.12 · PyIceberg（湖表）· DuckDB（S1 引擎）· PyArrow（数据�
 |---|---|---|
 | 1 | Fake 件清单（InMemoryLake/StaticFreshness/FakeDbt/FakeCube/RecordedEngine/FakeClock/InMemoryAudit/StaticPolicy） | ✅ 全部保留为**测试替身**（Seam 设计意图），真实实现另写——测试双轨 |
 | 2 | date_dim 表不存在 | ✅ 数据面自建日期维（进料时派生），不改 fieldforge |
-| 3 | 配产表不存在（指标 1 依赖） | ❓ 待确认：fieldforge 新增配产表供给，或 S1 先以 well_info 派生占位 |
+| 3 | 配产表不存在（指标 1 依赖） | ✅ **S1 派生占位**：月度配产 = oil_production_daily.plan_output 按区块月聚合（plan_output 列已存在）；fieldforge 新增正式配产表另票 |
 | 4 | 受效关系实体不存在 | ✅ **已解决**：fieldforge injection_connection（65 组，Σ=1）已供给 |
 | 5 | 一数四源无教学表 | ✅ SourceRef 映射：E7 统计上报→monthly_settlement（湖表化），仲裁注记 3.2% 为教学值如实标注 |
 | 6 | 修饰词仅指标 2 有值 | ✅ 其余 14 条 MetricDef.modifiers=空（默认口径） |
@@ -143,7 +143,7 @@ Python 3.12 · PyIceberg（湖表）· DuckDB（S1 引擎）· PyArrow（数据�
 | 12 | formula_additive 未定义 | ✅ 15 指标逐条标注可加性（附录随 S2 落） |
 | 13 | clean_batch_arrow 未闭环 | ✅ validate_batch 返回 (report, cleaned_arrow) 二元组 |
 | 14 | marts 模型缺口 | ✅ S1 先落 3 张示范模型（fct_block_monthly/fct_valid_output_monthly/fct_wellset_annual 最小列集） |
-| 15 | 映射表内容不全 | ❓ 待确认：fieldforge 脏特征已有部分（R3/BELT、N2/N-2），补全范围拍板 |
+| 15 | 映射表内容不全 | ✅ **最小补全**：fieldforge 种子已有 R3/BELT、N2/N-2 样本；数据面映射表 YAML 初版收录已知条目，补全另票 |
 | 16 | 三处水位两套账 | ✅ 唯一真源=dp2 FreshnessRegistry；m17 平台侧读它（真实化接线时对齐） |
 | 17 | UserContext 身份 | ✅ S1=静态 YAML 用户表（user/org/role），身份由调用方传入 |
 | 18 | rt 告警表 schema | ✅ rt_zero_value_alerts DDL 随 S2 CDC spec 落；数据源=fieldforge 亚日读数（已供给） |
@@ -154,14 +154,36 @@ Python 3.12 · PyIceberg（湖表）· DuckDB（S1 引擎）· PyArrow（数据�
 | 23 | S1 导出不可用 | ✅ 显式隐藏（工具清单不出现，非报错） |
 | 24 | 教学 DP 票已 done | ✅ 验收 checkbox 直接复用为本仓票面素材 |
 
-## 11. 待确认清单（阶段 1 逼问议程）
+## 10.5 阶段 1 逼问决策记录（2026-09-27，Owner 拍板）
 
-1. **配产表供给**（#3）：fieldforge 新增配产表，还是 S1 派生占位？
-2. **编码/井号映射表补全范围**（#15）：fieldforge 脏特征已有样本外，要不要把完整映射表作为 fieldforge 种子数据补齐？
-3. **S1 部署形态确认**：minio 容器并入 fieldforge 云 compose（本机 postgres 兼作 Iceberg catalog），还是独立栈？
-4. **仓库远端**：tpa-data-plane 建 GitHub 私有仓（zzwcoding 名下）还是先纯本地？
-5. **S1 验收口径**：以"老王问数 tracer bullet"（月度产量完成率一问全链路）作为 S1 出口验收，是否认可？
+| 待确认项 | 决策 |
+|---|---|
+| #3 配产表供给 | **S1 派生占位**（plan_output 聚合派生月度配产）；fieldforge 新增正式配产表另票 |
+| #15 映射表补全范围 | **最小补全**（已知条目进 YAML，扩展另票） |
+| S1 部署形态 | **minio 容器并入 fieldforge 云 compose**（postgres 兼作 Iceberg catalog） |
+| 仓库远端 | **纯本地**（不建 GitHub 仓） |
+| S1 验收口径 | **认可**："老王问数 tracer bullet"（月度产量完成率一问全链路）作为 S1 出口验收 |
+
+## 10.6 需求逼问 11 维闭单（requirement-checklist 对账）
+
+| 维度 | 判定 |
+|---|---|
+| A 目标与成功标准 | 适用——成功标准 = S1 tracer bullet（§10.5）+ W-DP 35 断言真实化 |
+| B 范围（做什么/不做什么） | 适用——§2 非目标五条，S2/S3 只留接口位 |
+| C 用户与场景 | 适用——消费方=tpa 服务端问数 Agent（五工具合同）；供给方=fieldforge |
+| D 功能需求 | 适用——DP1–DP9 逐模块（§5），签名以教学仓 dp 卡为唯一真源 |
+| E 数据需求 | 适用——§6 供给契约；配产表派生占位 |
+| F 非功能（量级/并发/合规） | 适用——S1 量级 67 万行锚点、无并发硬指标（沿教学演绎口径）、合成数据红线 |
+| G 技术栈与约束 | 适用——§4 宣布；本仓无 LLM（路由/话术=确定性代码） |
+| H 边界与权限 | 适用——dp9 三闸 + 行级作业区隔离 |
+| I 运维与部署 | 适用——并入 fieldforge 云 compose；minio 新增 |
+| J 里程碑与验收 | 适用——§9 S0–S3 |
+| K 风险与开放问题 | 适用——§10 裁决表（19 项已闭）；遗留=fieldforge 配产表另票 |
+
+## 11. 待确认清单
+
+已于 2026-09-27 阶段 1 逼问全部关闭（决策见 §10.5），PRD 定稿。
 
 ---
 
-*本 PRD 为粗稿；逼问收敛后翻"已定稿"。所有 [待确认] 项关闭前不开工 S1 编码（sdd-flow 纪律：约定赶在开发前）。*
+*本 PRD 已定稿；全部待确认项已于 2026-09-27 逼问关闭（§10.5）。S1 编码开工前无未决事项（sdd-flow 纪律：约定赶在开发前）。*
