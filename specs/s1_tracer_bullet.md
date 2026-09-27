@@ -1,6 +1,6 @@
 # spec —— S1 垂直切片：老王问数 tracer bullet
 
-状态: 已定稿
+状态: 已完成
 
 ## 触及的模块
 
@@ -20,7 +20,7 @@
 
 | # | 验收 | 对应断言/测试 |
 |---|---|---|
-| A1 | 进料：脏批被质检拦截，净批入湖后 freshness=offline、provenance 在案 | `tests/dp3/test_quality_gate.py + tests/dp2/test_ingest.py` |
+| A1 | 进料：脏批被质检拦截，净批入湖后 freshness=offline、provenance 在案 | `tests/dp3/test_quality_gate.py` + `tests/dp2/test_ingest.py` |
 | A2 | 湖表：schema 四件齐；快照隔离；谓词+列裁剪 | `tests/dp1/test_lake_store.py` |
 | A3 | 语义：catalog 15 条；block/rewrite/消歧 | `tests/dp4/test_semantic.py` |
 | A4 | 治理：✗ 边拒；跨作业区读拒 | `tests/dp9/test_governance.py` |
@@ -54,7 +54,7 @@
 
 | # | 验收 | 对应断言/测试 |
 |---|---|---|
-| A1 | 进料：脏批（班报重复行）被质检拦截，净批入湖后 freshness=offline、provenance 在案 | `tests/dp3/test_quality_gate.py + tests/dp2/test_ingest.py` |
+| A1 | 进料：脏批（班报重复行）被质检拦截，净批入湖后 freshness=offline、provenance 在案 | `tests/dp3/test_quality_gate.py` + `tests/dp2/test_ingest.py` |
 | A2 | 湖表：schema 四件齐；两次 append 后旧快照可读（隔离）；谓词+列裁剪 | `tests/dp1/test_lake_store.py` |
 | A3 | 语义：metric_catalog 15 条；"老完成率"block；"剔检产量"rewrite；"有效产量"无修饰词→消歧询问 | `tests/dp4/test_semantic.py` |
 | A4 | 治理：oil_production_daily⋈fluid_test 直连拒；渤中用户查渤南井拒 | `tests/dp9/test_governance.py` |
