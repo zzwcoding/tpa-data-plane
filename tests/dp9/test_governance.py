@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from app.data_plane.governance import Governance, StaticPolicy, StructuredQuery, UserContext
+from app.data_plane.governance import Governance, StaticPolicy, UserContext
+from app.data_plane.semantic import StructuredQuery
 
 POLICY = {
     "join_whitelist": [

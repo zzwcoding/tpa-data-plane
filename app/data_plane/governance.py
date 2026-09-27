@@ -26,17 +26,8 @@ class UserContext:
     role: str = "engineer"
 
 
-@dataclass(frozen=True)
-class StructuredQuery:
-    """四件套 + 显式槽位（裁决 #10：base_table/limit）。tables=参与表清单（裁决 #10）。"""
-    metric: str
-    base_table: str
-    tables: tuple
-    measures: tuple
-    dims: tuple
-    time_dimensions: tuple
-    filters: dict
-    limit: int | None = None
+# StructuredQuery 类型定义在 dp4（semantic.py，dp 卡钦定）；本模块只消费其形状
+# （.base_table/.tables/.metric），不 import dp4——依赖图 dp9 依赖=无。
 
 
 @dataclass(frozen=True)

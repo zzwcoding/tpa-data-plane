@@ -1,0 +1,201 @@
+# dp4 语义层字典（S1 静态 YAML）——15 条指标卡七件套 + 术语归一 + 权威源仲裁
+# 唯一原文 = teach-petro-agent/docs/business-setting.md §3/§6/§8；本文件零发明，教学值如实标注。
+# 裁决：MetricDef 含 version（#7）；修饰词除指标 2 外为空（#6）；additive 逐条标注（#12）。
+
+metrics:
+  - name: 产量完成率
+    version: 0.1.0
+    definition: 实际产油与计划配产之比
+    formula: "Σ(实际产油)/Σ(计划配产)×100"
+    unit: "%"
+    granularity: 月
+    modifiers: []
+    owner: 开发室
+    sql_table: oil_production_daily
+    additive: true
+    agg: { num: oil_output, den: plan_output, mul: 100 }
+    ai_context: 计划版本切换日存在双值行（配产口径争议）
+  - name: 有效产量
+    version: 0.1.0
+    definition: 开井日历折算 或 检修剔除 两支口径的月度有效产量
+    formula: "两支口径：开井日历折算 / 检修剔除"
+    unit: 吨
+    granularity: 月
+    modifiers: [开井日历, 检修剔除]
+    owner: 开发室
+    sql_table: oil_production_daily
+    additive: true
+    measures: [valid_output_calendar, valid_output_overhaul_excluded]
+    ai_context: 跨月检修切割争议；修饰词消歧在语义层（DP4）
+  - name: 自然递减率
+    version: 0.1.0
+    definition: 扣新井与措施增油后的月度产量递减
+    formula: "1−q_t/q_{t−1}（月）；年化 q(t)=q_i·e^{−Dt}"
+    unit: "%"
+    granularity: 月
+    modifiers: []
+    owner: 开发室
+    sql_table: oil_production_daily
+    additive: false
+    ai_context: 措施扣除口径争议
+  - name: 综合递减率
+    version: 0.1.0
+    definition: 不扣措施的对比期递减
+    formula: "1−q_t/q_{对比期}"
+    unit: "%"
+    granularity: 月
+    modifiers: []
+    owner: 开发室
+    sql_table: oil_production_daily
+    additive: false
+    ai_context: 与自然递减率混用事故
+  - name: 综合含水率
+    version: 0.1.0
+    definition: 产出水量占产液量比例
+    formula: "Q_w/(Q_o+Q_w)×100"
+    unit: "%"
+    granularity: 月
+    modifiers: []
+    owner: 开发室
+    sql_table: oil_production_daily
+    additive: true
+    ai_context: 化验 vs 计量打架（规则 4 消费）
+  - name: 注采比
+    version: 0.1.0
+    definition: 月注水量与月产液量之比（体积折算）
+    formula: "月注水量/月产液量"
+    unit: 无量纲
+    granularity: 月
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: water_injection_daily
+    additive: true
+    ai_context: 体积折算系数按区块取值；注采分析须经受效关系实体
+  - name: 累积亏空
+    version: 0.1.0
+    definition: 累积注水与累积产液之差
+    formula: "Σ注水−Σ产液"
+    unit: 方
+    granularity: 累计
+    modifiers: []
+    owner: 开发室
+    sql_table: water_injection_daily
+    additive: true
+    ai_context: ""
+  - name: 措施有效率
+    version: 0.1.0
+    definition: 有效井次占总井次比例
+    formula: "N_y/N_z×100"
+    unit: "%"
+    granularity: 批次
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: well_measures
+    additive: true
+    ai_context: "「有效」判据口径争议"
+  - name: 措施有效期
+    version: 0.1.0
+    definition: 措施有效期起止之差
+    formula: "t₂−t₁"
+    unit: 天
+    granularity: 单井·措施
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: well_measures
+    additive: false
+    ai_context: 30% 行缺失（P1 脏特征交付物）
+  - name: 递减增油
+    version: 0.1.0
+    definition: 受效油井实际产油与按递减拟合基线之差，多井受效按劈分系数分摊
+    formula: "实际产油 − q_0(1−d_a)^t；多井按劈分系数（Σ=1）"
+    unit: 吨
+    granularity: 井组·年
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: injection_connection
+    additive: false
+    ai_context: 一数多源争议之最（事故 7）；基线为拟合值非可加计量量
+  - name: 商品量
+    version: 0.1.0
+    definition: 脱水稳定后净重（扣自用油与输差）
+    formula: "Σ净重"
+    unit: 吨
+    granularity: 月
+    modifiers: []
+    owner: 销售计量站
+    sql_table: monthly_settlement
+    additive: true
+    ai_context: 与井口口径天然不等
+  - name: 机采系统能效
+    version: 0.1.0
+    definition: 机采系统三级能效（系统/单元/设备级）
+    formula: "有功功率/输入功率（分级限值）"
+    unit: "%"
+    granularity: 月
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: equip_status
+    additive: false
+    ai_context: 分组限值（前 30% 优良/后 30% 不合格）
+  - name: 检泵周期
+    version: 0.1.0
+    definition: 本次检泵日期与上次检泵日期之差
+    formula: "本次检泵日−上次检泵日"
+    unit: 天
+    granularity: 单井
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: well_overhaul
+    additive: false
+    ai_context: ""
+  - name: 抽油机时率
+    version: 0.1.0
+    definition: 开井时长占日历天比例
+    formula: "Σ(open_days)/Σ(日历天)×100"
+    unit: "%"
+    granularity: 月
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: oil_production_daily
+    additive: true
+    agg: { num: open_days, den: 日历天, mul: 100, den_is_calendar: true }
+    ai_context: ""
+  - name: 桶油增产成本
+    version: 0.1.0
+    definition: 措施总投入与折算增油量之比（桶）
+    formula: "C_总/(6.29×Q_j)"
+    unit: 元/桶
+    granularity: 批次
+    modifiers: []
+    owner: 采油工艺所
+    sql_table: well_measures
+    additive: true
+    ai_context: 经营×技术联席口径；ERP 数据源 S1 占位
+
+terms:
+  - term: 老完成率
+    action: block
+    canonical: 产量完成率
+    note: 禁用词（设定书 §6），替代=产量完成率
+  - term: 剔检产量
+    action: rewrite
+    canonical: 净产量（有效产量·检修剔除）
+    note: 别名归一
+  - term: 有效产量
+    action: clarify
+    canonical: 有效产量
+    note: 一词两译（开井日历/检修剔除），须修饰词消歧
+  - term: 躺井
+    action: pass
+    canonical: 躺井
+    note: 黑话=停产待检泵，限作业区语境
+  - term: 时率
+    action: rewrite
+    canonical: 抽油机时率
+    note: 缩写归一
+
+authoritative:
+  油气产量:
+    source: monthly_settlement
+    source_system: E7 统计上报
+    note: "A11 实时加和 vs E7 统计上报差 3.2%（事故 13，教学值）；A11 实时面仅日内趋势可用，正式月度口径以离线面月结为准"
