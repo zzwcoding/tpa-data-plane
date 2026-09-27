@@ -11,6 +11,7 @@ from __future__ import annotations
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import pyarrow as pa
 
@@ -395,3 +396,120 @@ def validate_bundle(bundle: dict, rules: list[QualityRule]) -> list[QualityRepor
         reports.append(QualityReport(passed=not locators, failures=[(rule.rule_id, *locators[:5])],
                                      rule_ids=[rule.rule_id]))
     return reports
+
+
+# ============================================================ S2-02 · marts 三张示范模型
+
+_MARTS_SQL = {
+    # 区块 × 月：产量完成率（指标 1，plan_output 派生占位口径）
+    "fct_block_monthly": """
+        SELECT w.block_name AS block_name,
+               strftime(p.prod_date, '%Y-%m') AS month,
+               round(sum(p.oil_output), 2) AS oil_output_sum,
+               round(sum(p.plan_output), 2) AS plan_output_sum,
+               round(sum(p.oil_output) / NULLIF(sum(p.plan_output), 0) * 100, 1) AS completion_rate
+        FROM read_csv_auto('{run}/oil_production_daily.csv') p
+        JOIN read_csv_auto('{run}/well_info.csv') w USING (well_id)
+        GROUP BY 1, 2
+    """,
+    # 有效产量两支口径（指标 2）：开井日历折算 / 检修剔除
+    "fct_valid_output_monthly": """
+        SELECT w.block_name AS block_name,
+               strftime(p.prod_date, '%Y-%m') AS month,
+               round(sum(p.oil_output * p.open_days / 24.0), 2) AS valid_output_calendar,
+               round(sum(CASE WHEN o.well_id IS NULL
+                              THEN p.oil_output * p.open_days / 24.0 ELSE 0 END), 2)
+                    AS valid_output_overhaul_excluded
+        FROM read_csv_auto('{run}/oil_production_daily.csv') p
+        JOIN read_csv_auto('{run}/well_info.csv') w USING (well_id)
+        LEFT JOIN (SELECT well_id, min(overhaul_start) AS s, max(overhaul_end) AS e
+                   FROM read_csv_auto('{run}/well_overhaul.csv') GROUP BY well_id) o
+          ON o.well_id = p.well_id
+         AND p.prod_date BETWEEN o.s AND o.e
+        GROUP BY 1, 2
+    """,
+    # 井组年增油（指标 10 形状）：受效油井按劈分系数聚合措施年增油
+    "fct_wellset_annual": """
+        SELECT c.producer_well_id AS producer_well_id,
+               round(sum(m.incr_oil_annual * c.split_coefficient), 2) AS incr_oil_wellset,
+               count(DISTINCT c.injector_well_id) AS injector_count
+        FROM read_csv_auto('{run}/injection_connection.csv') c
+        JOIN read_csv_auto('{run}/well_measures.csv') m ON m.well_id = c.producer_well_id
+        GROUP BY 1
+    """,
+}
+
+_UPSTREAMS = {
+    "fct_block_monthly": ("oil_production_daily", "well_info"),
+    "fct_valid_output_monthly": ("oil_production_daily", "well_info", "well_overhaul"),
+    "fct_wellset_annual": ("injection_connection", "well_measures"),
+}
+
+
+def build_marts(run_dir: Path, out_dir: Path) -> "BuildResult":
+    """S2：三张示范 marts 模型 DuckDB 物化（read_csv 直读→Parquet 落盘→manifest 记账）。
+
+    dbt 形状留位：models/tests/manifest 三件与 dbt build 对齐（DP3 底稿 L143-158）。
+    """
+    import json
+
+    import duckdb
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    nodes, parent_map, built = {}, {}, []
+    for model, sql in _MARTS_SQL.items():
+        duckdb.sql(sql.format(run=Path(run_dir))).write_parquet(str(out_dir / f"{model}.parquet"))
+        nodes[model] = {"columns": [c for c in _model_columns(out_dir / f"{model}.parquet")],
+                        "resource_type": "model"}
+        parent_map[f"model.petro.{model}"] = [f"source.petro.{u}" for u in _UPSTREAMS[model]]
+        built.append(model)
+    manifest = {"metadata": {"tool": "fieldforge-tpa-marts", "version": "0.1.0"},
+                "nodes": nodes, "parent_map": parent_map, "child_map": _invert(parent_map)}
+    ref = out_dir / "manifest.json"
+    ref.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return BuildResult(models_built=built, tests_passed=True, manifest_ref=str(ref))
+
+
+def _model_columns(parquet: Path) -> list[str]:
+    import pyarrow.parquet as pq
+    return pq.read_schema(parquet).names
+
+
+def _invert(parent_map: dict) -> dict:
+    child: dict[str, list] = {}
+    for model, parents in parent_map.items():
+        for p in parents:
+            child.setdefault(p, []).append(model)
+    return child
+
+
+@dataclass(frozen=True)
+class BuildResult:
+    models_built: list
+    tests_passed: bool
+    manifest_ref: str
+
+
+def lineage(model: str, manifest_ref: str | None = None) -> "LineageInfo":
+    """从 marts manifest 读血缘（S1=自有 manifest；dbt manifest 形状兼容）。"""
+    import json
+
+    ref = manifest_ref
+    if ref is None:  # 缺省：找最近一次 build 的产物目录
+        candidates = sorted(Path("out").glob("**/manifest.json"))
+        if not candidates:
+            raise FileNotFoundError("未找到 marts manifest（先 build_marts）")
+        ref = candidates[0]
+    manifest = json.loads(Path(ref).read_text(encoding="utf-8"))
+    uid = f"model.petro.{model}"
+    return LineageInfo(upstreams=manifest["parent_map"].get(uid, []),
+                       downstreams=manifest["child_map"].get(uid, []),
+                       columns=manifest["nodes"].get(model, {}).get("columns", []))
+
+
+@dataclass(frozen=True)
+class LineageInfo:
+    upstreams: list
+    downstreams: list
+    columns: list

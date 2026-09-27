@@ -145,6 +145,14 @@ class InMemoryCatalog:
             raise KeyError(f"表不存在：{name}")
         return _MemTableRef(self._tables[name])
 
+    def expire(self, table: str, keep: int) -> list[int]:
+        """滚动保留窗口：保留最近 keep 个快照，其余 expire（存储边界不是篡改口）。"""
+        state = self._tables[table]
+        keep_ids = {s.snapshot_id for s in state.snapshots[-keep:]}
+        gone = [s.snapshot_id for s in state.snapshots if s.snapshot_id not in keep_ids]
+        state.by_snapshot = {k: v for k, v in state.by_snapshot.items() if k in keep_ids}
+        return gone
+
     def append(self, table: str, arrow: pa.Table, commit_meta: dict) -> SnapshotInfo:
         if self._caller not in _WRITE_ALLOWED:
             raise BoundaryViolation(
