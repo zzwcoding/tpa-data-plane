@@ -56,6 +56,9 @@ _SQL_TEMPLATES = {
 class DuckRunner:
     """S3 执行适配：DuckDB 直读 run 目录 CSV（模板 v0）。"""
     engine = "duckdb"
+    def __init__(self, run_dir: Path):
+        self.run_dir = Path(run_dir)
+
 
     def execute(self, query, snapshot_id=None, guard=None):
         import duckdb
@@ -69,7 +72,7 @@ class DuckRunner:
             import re as _re
             if not _re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(d)):
                 raise ValueError(f"非法日期：{d}")
-        sql = tpl.format(run=str(RUN_DIR)).replace("?", f"'{start}'").replace("?", f"'{end}'")
+        sql = tpl.format(run=str(self.run_dir)).replace("?", f"'{start}'").replace("?", f"'{end}'")
         rows = duckdb.sql(sql).fetchall()
         cols = ["block_name", "month", "value"]
         arrow = [{cols[0]: r[0], cols[1]: r[1], "value": float(r[2])} for r in rows]
@@ -111,14 +114,15 @@ def build_tools() -> DataTools:
     run = _latest_run()
     if run is None:
         raise RuntimeError(f"{RUN_DIR} 下没有可用 run（先进料 fieldforge 产物）")
+    engine = DuckRunner(run_dir=run)
     tables = {t: {"tier": "offline", "freshness": "2026-09-26", "metrics": []}
               for t in TABLES_ENV.split(",")}
     tables["oil_production_daily"]["metrics"] = ["产量完成率", "商品量"]
     gov = Governance(StaticPolicy(POLICY))
     sem = Semantic(StaticYaml.default())
-    audit = Audit(store=InMemoryAudit(), runner=DuckRunner(), clock=_Clock())
+    audit = Audit(store=InMemoryAudit(), runner=engine, clock=_Clock())
     router = FreshnessRouter(semantic=sem, freshness=_Reg(tables), clock=_Clock())
-    runner = QueryRunner(catalog=None, engines=[DuckRunner()], governance=gov)
+    runner = QueryRunner(catalog=None, engines=[engine], governance=gov)
     return DataTools(governance=gov, semantic=sem, runner=runner, router=router,
                      audit=audit, catalog_tables=tables,
                      default_ctx=UserContext("service", "总部", "admin"))

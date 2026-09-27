@@ -6,7 +6,6 @@ COPY deploy/api-requirements.txt deploy/api-requirements.txt
 RUN pip install --no-cache-dir -r deploy/api-requirements.txt
 COPY app/ app/
 COPY serve/ serve/
-COPY schemas/ schemas/
 COPY tools/ tools/
 RUN useradd -m dpuser && useradd -m ffuser 2>/dev/null; true
 EXPOSE 8100
