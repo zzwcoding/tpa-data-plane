@@ -222,9 +222,27 @@ def _r10_constant_30d(bundle: dict) -> list[Locator]:
 
 
 def _r11_realtime_domain(bundle: dict) -> list[Locator]:
-    """规则 11：传感器零值 2 小时告警——实时域规则（设定书自标教学演绎），
-    日批 bundle 不可判；亚日数据接入后由 dp6 realtime 分支消费。恒空=如实。"""
-    return []
+    """规则 11：传感器零值 2 小时告警——15 分钟档 8 连零（RF2-01 真机判）。
+
+    bundle 含 sensor_reading_subdaily 时逐通道机判（按 ts 排序后数连零）；
+    纯日批 bundle 恒空=如实（日粒度不可判，设定书自标教学演绎）。"""
+    rows = bundle.get("sensor_reading_subdaily", [])
+    if not rows:
+        return []
+    series: dict[str, list] = {}
+    for r in rows:
+        chan = r.get("channel_id")
+        series.setdefault(chan, []).append((_num(r, "value") or 0.0, r.get("ts")))
+    bad = []
+    for chan, pairs in series.items():
+        pairs.sort(key=lambda x: x[1])
+        run = worst = 0
+        for v, _ in pairs:
+            run = run + 1 if v == 0.0 else 0
+            worst = max(worst, run)
+        if worst >= 8:
+            bad.append({"channel_id": chan, "max_zero_run": worst, "threshold": 8})
+    return bad
 
 
 def _r12_material_balance(bundle: dict) -> list[Locator]:

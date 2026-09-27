@@ -54,7 +54,7 @@ def test_retention_real_chain(env):
         refs.append(audit.record(f"q-{i}", q(), snap.snapshot_id, "0.1.0", "pass",
                                  original=view))  # original=当期快照全视图
         # 每轮执行保留策略（rolling=2）
-        cat.expire("t", keep=audit.retention_policy().rolling)
+        audit.enforce_retention(cat, "t")
 
     # 快照 1–3 已被 expire：replay 显式报错（真链路，DP-W-D7-3）
     with pytest.raises(SnapshotGoneError):

@@ -55,6 +55,12 @@ class Audit:
         self.clock = clock
         self._retention = retention or RetentionPolicy(rolling=50, hard_cap=200)
 
+    def enforce_retention(self, catalog, table: str) -> list[int]:
+        """保留策略执行入口（RF2-05）：以 dp7.retention 身份驱动 dp1.expire。"""
+        cat = catalog.cat if hasattr(catalog, "cat") else catalog
+        cat.begin_caller("dp7.retention")
+        return cat.expire(table, keep=self._retention.rolling)
+
     def retention_policy(self) -> RetentionPolicy:
         return self._retention
 

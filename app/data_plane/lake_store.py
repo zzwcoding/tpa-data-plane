@@ -146,7 +146,13 @@ class InMemoryCatalog:
         return _MemTableRef(self._tables[name])
 
     def expire(self, table: str, keep: int) -> list[int]:
-        """滚动保留窗口：保留最近 keep 个快照，其余 expire（存储边界不是篡改口）。"""
+        """滚动保留窗口：保留最近 keep 个快照，其余 expire（存储边界不是篡改口）。
+
+        破坏性写面与 append 同闸：仅 dp7.retention 可调（RF2-05）。"""
+        if self._caller not in ("dp7.retention",):
+            raise BoundaryViolation(
+                f"dp1.expire 调用方 {self._caller!r} 不在白名单 ('dp7.retention',)（保留策略执行面收敛）")
+        keep = max(int(keep), 1)  # keep=0/负数特判：至少保留当前快照（P2-1）
         state = self._tables[table]
         keep_ids = {s.snapshot_id for s in state.snapshots[-keep:]}
         gone = [s.snapshot_id for s in state.snapshots if s.snapshot_id not in keep_ids]
