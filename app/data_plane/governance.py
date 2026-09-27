@@ -83,7 +83,9 @@ class Governance:
 
     def authorize(self, ctx: UserContext, table: str, action: str,
                   requested_scope: str | None = None) -> Decision:
-        """fail-closed：用户未知 / 用户无 org / scope 无法确立 → 一律拒绝。"""
+        """fail-closed：无身份 / 用户未知 / 用户无 org / scope 无法确立 → 一律拒绝。"""
+        if ctx is None:
+            return Decision(allowed=False, reason="无调用身份（fail-closed）")
         u = self.policy.user(ctx.user_id)
         if u is None:
             return Decision(allowed=False, reason=f"未知用户 {ctx.user_id}")
@@ -92,10 +94,12 @@ class Governance:
         user_org = u.get("org")
         if not user_org:
             return Decision(allowed=False, reason="用户档案缺归属作业区（fail-closed）")
+        if ctx.role == "admin":
+            return Decision(allowed=True)  # 管理员不受作业区清单/行级约束
         scope = requested_scope or user_org
         if scope not in self.policy.row_scope.get("orgs", []):
             return Decision(allowed=False, reason=f"scope {scope} 不在合法作业区清单")
-        if ctx.role != "admin" and scope != user_org:
+        if scope != user_org:
             return Decision(allowed=False,
                             reason=f"行级隔离：{user_org} 作业区用户不可读 {scope} 井数据")
         return Decision(allowed=True)
