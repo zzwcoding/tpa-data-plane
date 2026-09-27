@@ -45,13 +45,13 @@ class TestRoute:
         assert str(d.declared_as_of) == "2026-09-26"
 
     def test_month_metric_intraday_nonadditive_refused(self):
-        """DP-W-D6-1 分支 A：月指标×日内窗×非可加×offline → 拒（任何时候都答不了）。"""
-        d = make_router().route(w("2026-09-27 08:00", "2026-09-27 12:00", "intraday"), "自然递减率")
+        """DP-W-D6-1 正典：产量完成率（含计划值分母=非可加）×今天上午 → 粒度拒，档位无关。"""
+        d = make_router().route(w("2026-09-27 08:00", "2026-09-27 12:00", "intraday"), "产量完成率")
         assert d.answerable is False and d.refusal.kind == "granularity"
 
     def test_intraday_additive_offline_deferred(self):
-        """分支 B'：日内窗 × offline → defer（T+1 明日可答）。"""
-        d = make_router().route(w("2026-09-27 08:00", "2026-09-27 12:00", "intraday"), "产量完成率")
+        """分支 B'：日内窗 × 可加指标 × offline → defer（T+1 明日此问可答——可加量承诺成立）。"""
+        d = make_router().route(w("2026-09-27 08:00", "2026-09-27 12:00", "intraday"), "商品量")
         assert d.answerable is False and d.refusal.kind == "defer"
 
     def test_realtime_additive_intraday_answerable_with_caliber_note(self):

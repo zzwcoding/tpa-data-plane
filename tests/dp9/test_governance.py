@@ -67,6 +67,13 @@ class TestAuthorize:
         d = gov.authorize(ctx, "oil_production_daily", "export")
         assert d.allowed is False and "S1" in d.reason
 
+    def test_fail_closed_on_missing_org(self, gov):
+        """RF-01：用户档案缺 org 且未传 scope → 显式拒绝（不静默放行）。"""
+        gov.policy.users["noorg"] = {"user_id": "noorg", "org": "", "role": "engineer"}
+        ctx = UserContext("noorg", org="", role="engineer")
+        d = gov.authorize(ctx, "oil_production_daily", "read")
+        assert d.allowed is False and "fail-closed" in d.reason
+
     def test_unknown_user_rejected(self, gov):
         ctx = UserContext("intruder", org="渤中", role="engineer")
         assert gov.authorize(ctx, "oil_production_daily", "read").allowed is False

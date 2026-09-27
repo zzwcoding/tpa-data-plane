@@ -54,6 +54,18 @@ class TimeWindow:
     end: str
     granularity: str  # day | month | intraday
 
+    def get(self, key):
+        return getattr(self, key)
+
+
+@dataclass(frozen=True)
+class Clarify:
+    """消歧询问（卡面返回类型 StructuredQuery | Clarify 的后者）。"""
+    metric: str
+    options: list
+    note: str
+    kind: str = "clarify"
+
 
 @dataclass(frozen=True)
 class StructuredQuery:
@@ -66,13 +78,6 @@ class StructuredQuery:
     time_dimensions: tuple
     filters: dict
     limit: int | None = None
-
-
-@dataclass(frozen=True)
-class TimeWindow:
-    start: str
-    end: str
-    granularity: str  # day | month | intraday
 
 
 class StaticYaml:
@@ -139,26 +144,29 @@ class Semantic:
         card = self._by_name.get(metric)
         if card is None:
             raise KeyError(f"指标未在语义层注册：{metric}")
+        def win(key):
+            if isinstance(time_window, TimeWindow):
+                return time_window.get(key)
+            return time_window[key]
+
         measures = tuple(card.get("measures", ()))
         if len(measures) > 1:  # 一词多 measure（裁决：消歧在本层，DP-W-D4-2）
             modifier = filters.get("口径")
             if modifier not in card.get("modifiers", []):
-                return {"kind": "clarify", "metric": metric,
-                        "options": list(card.get("modifiers", [])),
-                        "note": card.get("ai_context", "")}
+                return Clarify(metric=metric, options=list(card.get("modifiers", [])),
+                               note=card.get("ai_context", ""))
             chosen = self._measure_for(card, modifier)
         else:
             chosen = card["name"]
         tables = {card["sql_table"]}
         for d in dims:
             tables.add(card["sql_table"])  # S1：dims 均落基表列
-        return {"kind": "executable",
-                "query": StructuredQuery(
-                    metric=metric, base_table=card["sql_table"], tables=tuple(sorted(tables)),
-                    measures=(chosen,), dims=tuple((d, card["sql_table"]) for d in dims),
-                    time_dimensions=({"dateRange": [time_window["start"], time_window["end"]],
-                                      "granularity": time_window["granularity"]},),
-                    filters=dict(filters), limit=None)}
+        return StructuredQuery(
+            metric=metric, base_table=card["sql_table"], tables=tuple(sorted(tables)),
+            measures=(chosen,), dims=tuple((d, card["sql_table"]) for d in dims),
+            time_dimensions=({"dateRange": [win("start"), win("end")],
+                              "granularity": win("granularity")},),
+            filters=dict(filters), limit=None)
 
     @staticmethod
     def _measure_for(card: dict, modifier: str) -> str:

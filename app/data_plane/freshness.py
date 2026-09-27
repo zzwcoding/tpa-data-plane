@@ -107,8 +107,9 @@ class FreshnessRouter:
         wg = _win_get(window, "granularity")
         as_of = info.as_of
 
-        # 分支 A：月指标 × 日内窗 × 非可加 × offline —— 任何时候都答不了官方口径
-        if md.granularity == "月" and wg == "intraday" and not md.additive and info.tier == "offline":
+        # 分支 A（RF-04）：月指标 × 日内窗 × 非可加 —— 粒度拒绝，档位无关
+        # （含计划值/拟合基线/比率的口径任何时候都答不了日内官方值；可加量走分支 B/B'）
+        if md.granularity == "月" and wg == "intraday" and not md.additive:
             return self._refuse(md, info, "granularity",
                                 f"该指标官方口径为{md.granularity}粒度，无法按日内粒度作答")
         # 分支 B：日内窗 × realtime/nearline × 可加 —— 答实时/近线面临时值

@@ -71,7 +71,10 @@ class Audit:
         ref_id = ref.audit_id if isinstance(ref, AuditRef) else ref
         rec = self.store.get(ref_id)  # 未知 ref → KeyError 显式失败
         result = self.runner.run(rec.query, snapshot_id=rec.snapshot_id)  # 按记录快照重跑
+        # RF-05 等值归一：dp5 合同 arrow=ArrowTable（或 list），与记录侧 to_pylist 比较
         current = result.arrow
+        if hasattr(current, "to_pylist"):
+            current = current.to_pylist()
         match = current == rec.original
         return ReplayResult(match=match, original=rec.original, current=current)
 

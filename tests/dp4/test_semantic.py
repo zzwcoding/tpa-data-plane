@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.data_plane.semantic import StaticYaml, Semantic
+from app.data_plane.semantic import Clarify, Semantic, StaticYaml
 
 SEM = Semantic(StaticYaml.default())
 
@@ -20,8 +20,10 @@ class TestMetricCatalog:
         assert cats["产量完成率"].modifiers == ()
 
     def test_additive_annotated(self):
+        """F12 判据：含计划值/拟合基线/比率=非可加；纯可加计量=可加。"""
         cats = {m.name: m for m in SEM.metric_catalog()}
-        assert cats["产量完成率"].additive is True
+        assert cats["产量完成率"].additive is False  # 分母含计划配产（非可加）
+        assert cats["综合含水率"].additive is True   # 分子分母均为可加计量
         assert cats["自然递减率"].additive is False  # 拟合基线非可加
 
 
@@ -48,25 +50,27 @@ class TestBuildQuery:
         r = SEM.build_query("有效产量", dims=["block_name"],
                             time_window={"start": "2025-09-01", "end": "2025-09-30",
                                          "granularity": "month"}, filters={})
-        assert isinstance(r, dict) and r["kind"] == "clarify"
-        assert set(r["options"]) == {"开井日历", "检修剔除"}
+        assert isinstance(r, Clarify) and set(r.options) == {"开井日历", "检修剔除"}  # DP-W-D4-2
 
     def test_modifier_selects_measure(self):
         r = SEM.build_query("有效产量", dims=["block_name"],
                             time_window={"start": "2025-09-01", "end": "2025-09-30",
                                          "granularity": "month"},
                             filters={"口径": "检修剔除"})
-        assert r["kind"] == "executable"
-        assert r["query"].measures == ("valid_output_overhaul_excluded",)
+        assert r.measures == ("valid_output_overhaul_excluded",)
 
     def test_simple_metric_executable_with_base_table(self):
         """裁决 #10：base_table/limit 显式槽位。"""
         r = SEM.build_query("产量完成率", dims=["block_name"],
                             time_window={"start": "2025-09-01", "end": "2025-09-30",
                                          "granularity": "month"}, filters={})
-        assert r["kind"] == "executable"
-        assert r["query"].base_table == "oil_production_daily"
-        assert "oil_production_daily" in r["query"].tables
+        assert r.base_table == "oil_production_daily"
+        assert "oil_production_daily" in r.tables
+        # TimeWindow 实例与 dict 双路兼容（RF-02）
+        from app.data_plane.semantic import TimeWindow
+        r2 = SEM.build_query("产量完成率", dims=["block_name"],
+                             time_window=TimeWindow("2025-09-01", "2025-09-30", "month"), filters={})
+        assert r2.time_dimensions[0]["dateRange"] == r.time_dimensions[0]["dateRange"]
 
 
 class TestAuthoritativeSource:

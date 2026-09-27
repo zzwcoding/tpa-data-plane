@@ -83,17 +83,21 @@ class Governance:
 
     def authorize(self, ctx: UserContext, table: str, action: str,
                   requested_scope: str | None = None) -> Decision:
+        """fail-closed：用户未知 / 用户无 org / scope 无法确立 → 一律拒绝。"""
         u = self.policy.user(ctx.user_id)
         if u is None:
             return Decision(allowed=False, reason=f"未知用户 {ctx.user_id}")
         if action == "export":
             return Decision(allowed=False, reason="S1 导出整体降级为不可用（DP-W-D9-3 属 S2+ 审批位）")
-        scope = requested_scope or u.get("org")
-        if ctx.role != "admin" and scope and scope not in self.policy.row_scope.get("orgs", []):
+        user_org = u.get("org")
+        if not user_org:
+            return Decision(allowed=False, reason="用户档案缺归属作业区（fail-closed）")
+        scope = requested_scope or user_org
+        if scope not in self.policy.row_scope.get("orgs", []):
             return Decision(allowed=False, reason=f"scope {scope} 不在合法作业区清单")
-        if ctx.role != "admin" and requested_scope and requested_scope != u["org"]:
+        if ctx.role != "admin" and scope != user_org:
             return Decision(allowed=False,
-                            reason=f"行级隔离：{u['org']} 作业区用户不可读 {requested_scope} 井数据")
+                            reason=f"行级隔离：{user_org} 作业区用户不可读 {scope} 井数据")
         return Decision(allowed=True)
 
     # ---- S3 形状留位 -------------------------------------------------------
