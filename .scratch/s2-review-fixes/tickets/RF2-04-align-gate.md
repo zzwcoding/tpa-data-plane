@@ -1,6 +1,6 @@
 # RF2-04 · dp4 对齐闸落生产代码（P1）
 
-Status: todo | 源: S2 审查（四轴）
+Status: done | 源: S2 审查（四轴）
 
 ## 修复内容
 

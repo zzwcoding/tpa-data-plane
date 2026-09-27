@@ -1,6 +1,6 @@
 # RF2-06 · 测试补全 + P2 批次（P1）
 
-Status: todo | 源: S2 审查（四轴）
+Status: done | 源: S2 审查（四轴）
 
 ## 修复内容
 

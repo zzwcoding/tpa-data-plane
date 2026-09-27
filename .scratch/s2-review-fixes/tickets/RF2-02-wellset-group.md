@@ -1,6 +1,6 @@
 # RF2-02 · marts 劈分分组键（P1）
 
-Status: todo | 源: S2 审查（四轴）
+Status: done | 源: S2 审查（四轴）
 
 ## 修复内容
 

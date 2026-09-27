@@ -1,6 +1,6 @@
 # RF2-05 · expire 调用方闸 + enforce 入口（P1）
 
-Status: todo | 源: S2 审查（四轴）
+Status: done | 源: S2 审查（四轴）
 
 ## 修复内容
 
