@@ -24,7 +24,7 @@ metrics:
     granularity: 月
     modifiers: [开井日历, 检修剔除]
     owner: 开发室
-    sql_table: oil_production_daily
+    sql_table: fct_valid_output_monthly
     source: oil_production_daily + well_overhaul
     additive: true
     measures: [valid_output_calendar, valid_output_overhaul_excluded]

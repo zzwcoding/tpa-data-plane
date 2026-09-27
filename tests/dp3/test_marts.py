@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import json
+
 import pytest
 
 from app.data_plane.transform import build_marts, lineage
@@ -71,3 +73,27 @@ class TestBuildMarts:
         result, out = built
         manifest = json.loads(Path(result.manifest_ref).read_text(encoding="utf-8"))
         assert "nodes" in manifest and "parent_map" in manifest
+
+
+class TestAlignGate:
+    def test_align_passes_with_built_marts(self, built):
+        """RF2-04：对齐闸落生产代码——有效产量 sql_table=fct_valid_output_monthly。"""
+        from app.data_plane.semantic import Semantic, StaticYaml
+        result, _ = built
+        manifest = json.loads(Path(result.manifest_ref).read_text(encoding="utf-8"))
+        sem = Semantic(StaticYaml.default())
+        m = {c.name: c for c in sem.metric_catalog()}
+        assert m["有效产量"].sql_table == "fct_valid_output_monthly"
+        assert sem.align_with_manifest(manifest) == []
+
+    def test_align_gate_rejects_missing_model(self, built):
+        """负样本：登记缺失模型 → 对齐闸返回缺失项（不放行）。"""
+        import json
+        from app.data_plane.semantic import Semantic, StaticYaml
+        result, _ = built
+        manifest = json.loads(Path(result.manifest_ref).read_text(encoding="utf-8"))
+        missing_manifest = {"nodes": {k: v for k, v in manifest["nodes"].items()
+                                      if k != "fct_valid_output_monthly"}}
+        sem = Semantic(StaticYaml.default())
+        missing = sem.align_with_manifest(missing_manifest)
+        assert any("fct_valid_output_monthly" in x for x in missing)

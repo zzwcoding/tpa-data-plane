@@ -173,6 +173,23 @@ class Semantic:
         idx = card.get("modifiers", []).index(modifier)
         return card["measures"][idx]
 
+    # ---- 对齐闸（RF2-04）：sql_table 指向 marts 模型时须模型+列级在 manifest ----
+
+    def align_with_manifest(self, manifest: dict) -> list[str]:
+        models = {name: (v.get("columns") or []) for name, v in manifest.get("nodes", {}).items()}
+        missing = []
+        for m in self.metric_catalog():
+            if not m.sql_table.startswith("fct_"):
+                continue  # 基表指标不经对齐闸（闸是 marts 暴露面专用）
+            if m.sql_table not in models:
+                missing.append(f"{m.name}: 模型 {m.sql_table} 不在 manifest")
+                continue
+            cols = set(models[m.sql_table])
+            for measure in m.measures:
+                if measure not in cols:
+                    missing.append(f"{m.name}: measure {measure} 不在 {m.sql_table} 列")
+        return missing
+
     # ---- 权威源仲裁（一数四源，事故 13） ------------------------------------
 
     def authoritative_source(self, metric: str) -> SourceRef:

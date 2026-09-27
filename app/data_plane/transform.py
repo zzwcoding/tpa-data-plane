@@ -203,7 +203,8 @@ def _r9_state_lag(bundle: dict) -> list[Locator]:
 def _r10_constant_30d(bundle: dict) -> list[Locator]:
     """规则 10：连续 30 日恒值 → 告警级（warn，非 fail）。"""
     by_well: dict[str, list] = {}
-    for r in bundle.get("oil_production_daily", []):
+    for r in sorted(bundle.get("oil_production_daily", []),
+                    key=lambda r: (r.get("well_id"), r.get("prod_date"))):
         by_well.setdefault(r.get("well_id"), []).append(r)
     hits = []
     for wid, rows in by_well.items():
@@ -246,7 +247,10 @@ def _r11_realtime_domain(bundle: dict) -> list[Locator]:
 
 
 def _r12_material_balance(bundle: dict) -> list[Locator]:
-    """规则 12：区块月物质平衡 注入 ≈ 产液×(1±3%)（存水率变动并入容差）。"""
+    """规则 12：区块月物质平衡 注入 ≈ 产液×(1±3%)。
+
+    有意分歧注记：fieldforge r12 对齐"结算 vs 产量"，本仓按设定书 §4 原文
+    "注入量≈产出量+存水率变动"对齐"注入 vs 产液"——两处不要互相"对齐"。"""
     inj: dict[tuple, float] = {}
     for r in bundle.get("water_injection_daily", []):
         key = (r.get("well_id"), str(r.get("prod_date"))[:7])
@@ -291,7 +295,8 @@ def _r15_injection_continuity(bundle: dict) -> list[Locator]:
     """规则 15（跨表逻辑一致/注采连续性）：日注水量环比无骤变（>3× 挂）。"""
     import math
     by_well: dict[str, list] = {}
-    for r in bundle.get("water_injection_daily", []):
+    for r in sorted(bundle.get("water_injection_daily", []),
+                    key=lambda r: (r.get("well_id"), r.get("prod_date"))):
         by_well.setdefault(r.get("well_id"), []).append(_num(r, "inj_volume") or 0.0)
     bad = []
     for wid, vals in by_well.items():
@@ -334,7 +339,7 @@ def _r18_volatility(bundle: dict) -> list[Locator]:
     rows = [r for r in bundle.get("oil_production_daily", [])
             if (_num(r, "open_days") or 0) > 0]
     by_well: dict[str, list] = {}
-    for r in rows:
+    for r in sorted(rows, key=lambda r: (r.get("well_id"), r.get("prod_date"))):
         by_well.setdefault(r.get("well_id"), []).append(_num(r, "oil_output") or 0.0)
     bad = []
     for wid, vals in by_well.items():
@@ -365,7 +370,7 @@ def _r19_settlement_hook(bundle: dict) -> list[Locator]:
 
 
 def _r20_scrub(bundle: dict) -> list[Locator]:
-    """规则 20（scrub/规范化）：字符字段未 trim、大小写不规范。"""
+    """规则 20（scrub/规范化）：字符字段未 trim（大小写规范化 S2 后续）。"""
     bad = []
     for r in bundle.get("oil_production_daily", []):
         for f in ("report_shift", "well_id"):
@@ -395,7 +400,7 @@ RULES_FULL = [
     _b("rule-11", "传感器零值 2 小时告警（实时域）", "及时性", _r11_realtime_domain),
     _b("rule-12", "区块月物质平衡 ≤3%", "一致性", _r12_material_balance),
     _b("rule-13", "引用完整（well_id 孤儿行）", "引用完整", _r13_referential),
-    _b("rule-14", "表内逻辑一致（停机归零）", "跨表一致", _r14_intra_table_logic),
+    _b("rule-14", "表内逻辑一致（停机归零）", "表内一致", _r14_intra_table_logic),
     _b("rule-15", "注采连续性（日环比无骤变）", "跨表一致", _r15_injection_continuity),
     _b("rule-16", "枚举合法", "枚举合法", _r16_enum_legal),
     _b("rule-17", "极值（油压量程）", "极值", _r17_extremes),
@@ -430,27 +435,29 @@ _MARTS_SQL = {
         JOIN read_csv_auto('{run}/well_info.csv') w USING (well_id)
         GROUP BY 1, 2
     """,
-    # 有效产量两支口径（指标 2）：开井日历折算 / 检修剔除
+    # 有效产量两支口径（指标 2）：开井日历折算 / 检修剔除（RF2-03 逐行窗口 EXISTS）
     "fct_valid_output_monthly": """
-        SELECT w.block_name AS block_name,
-               strftime(p.prod_date, '%Y-%m') AS month,
-               round(sum(p.oil_output * p.open_days / 24.0), 2) AS valid_output_calendar,
-               round(sum(CASE WHEN o.well_id IS NULL
-                              THEN p.oil_output * p.open_days / 24.0 ELSE 0 END), 2)
-                    AS valid_output_overhaul_excluded
-        FROM read_csv_auto('{run}/oil_production_daily.csv') p
-        JOIN read_csv_auto('{run}/well_info.csv') w USING (well_id)
-        LEFT JOIN (SELECT well_id, min(overhaul_start) AS s, max(overhaul_end) AS e
-                   FROM read_csv_auto('{run}/well_overhaul.csv') GROUP BY well_id) o
-          ON o.well_id = p.well_id
-         AND p.prod_date BETWEEN o.s AND o.e
-        GROUP BY 1, 2
+        WITH daily AS (
+            SELECT w.block_name AS block_name,
+                   strftime(p.prod_date, '%Y-%m') AS month,
+                   p.oil_output * p.open_days / 24.0 AS cal,
+                   CASE WHEN EXISTS (SELECT 1 FROM read_csv_auto('{run}/well_overhaul.csv') o
+                                     WHERE o.well_id = p.well_id
+                                       AND p.prod_date BETWEEN o.overhaul_start AND o.overhaul_end)
+                        THEN 0.0 ELSE p.oil_output * p.open_days / 24.0 END AS excl
+            FROM read_csv_auto('{run}/oil_production_daily.csv') p
+            JOIN read_csv_auto('{run}/well_info.csv') w USING (well_id)
+        )
+        SELECT block_name, month,
+               round(sum(cal), 2) AS valid_output_calendar,
+               round(sum(excl), 2) AS valid_output_overhaul_excluded
+        FROM daily GROUP BY 1, 2
     """,
-    # 井组年增油（指标 10 形状）：受效油井按劈分系数聚合措施年增油
+    # 井组年增油（指标 10）：井组=注水井受效井组（RF2-02 分组键修正）
     "fct_wellset_annual": """
-        SELECT c.producer_well_id AS producer_well_id,
+        SELECT c.injector_well_id AS injector_well_id,
                round(sum(m.incr_oil_annual * c.split_coefficient), 2) AS incr_oil_wellset,
-               count(DISTINCT c.injector_well_id) AS injector_count
+               count(DISTINCT c.producer_well_id) AS producer_count
         FROM read_csv_auto('{run}/injection_connection.csv') c
         JOIN read_csv_auto('{run}/well_measures.csv') m ON m.well_id = c.producer_well_id
         GROUP BY 1
