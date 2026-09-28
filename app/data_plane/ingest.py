@@ -2,7 +2,8 @@
 
 - 闸在编排层：validate_batch 先行（不合格 raise BatchRejected，append 不发生——DP-W-D2-1）；
 - run_batch_load 以 dp2.ingest 身份调 dp1.append（写面白名单），provenance 随 commit 落元数据；
-- FreshnessRegistry seam：S1=内存注册表（FreshnessRegistry），同表多管道取 as_of 最新；
+- FreshnessRegistry seam：内存版（InMemoryFreshnessRegistry）=测试替身（PRD 裁决 #1），
+  真身=pg_store.PgFreshnessRegistry（P0 持久化热修，docs/adr/0002）；同表多管道取 as_of 最新；
 - cdc_pipeline_spec 只产形状（S2 零实装）。
 """
 from __future__ import annotations
@@ -34,8 +35,9 @@ class FlinkJobSpec:
     config_ref: str
 
 
-class FreshnessRegistry:
-    """S1 注册表：{table: FreshnessInfo}；同表多管道取 as_of 最新（DP2 底稿 L52-64）。"""
+class InMemoryFreshnessRegistry:
+    """测试替身（PRD 裁决 #1）：内存 {table: FreshnessInfo}，进程重启即失——仅供测试/无 PG 本地兜底；
+    真身=pg_store.PgFreshnessRegistry。同表多管道取 as_of 最新（DP2 底稿 L52-64）。"""
 
     def __init__(self):
         self._reg: dict[str, FreshnessInfo] = {}
@@ -49,6 +51,9 @@ class FreshnessRegistry:
         return self._reg.get(table, FreshnessInfo(tier="unknown", as_of=None, pipeline=None))
 
 
+FreshnessRegistry = InMemoryFreshnessRegistry  # 兼容别名：既有测试/装配点沿用；生产装配用 PG 真身
+
+
 def _as_dt(v):
     if isinstance(v, datetime):
         return v
@@ -56,9 +61,9 @@ def _as_dt(v):
 
 
 class Ingest:
-    def __init__(self, *, catalog, freshness: FreshnessRegistry, rules: dict | None = None):
+    def __init__(self, *, catalog, freshness, rules: dict | None = None):
         self.catalog = catalog          # dp1 门面（append 身份由本模块声明）
-        self._registry = freshness      # 名字避开 freshness() 方法（属性冲突教训）
+        self._registry = freshness      # FreshnessRegistry seam（替身|PG 真身）；名字避开 freshness() 方法（属性冲突教训）
         self._rules = rules or {}       # 表 → 质量规则清单（入湖必过质检）
 
     def run_batch_load(self, table: str, records, provenance: Provenance):

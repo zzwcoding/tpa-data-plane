@@ -2,3 +2,4 @@ fastapi>=0.115
 uvicorn[standard]>=0.30
 PyYAML>=6
 duckdb>=1.0
+psycopg[binary]>=3.1  # P0 持久化热修：freshness/audit PG 真身（未配 DATABASE_URL 不触发连接）

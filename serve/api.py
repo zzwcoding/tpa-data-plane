@@ -2,7 +2,9 @@
 
 - 组装=真实 dp 模块（治理闸/语义/路由/审计/执行），数据=fieldforge 云端 run 目录；
 - 查询模板 v0：产量完成率 / 商品量（S1 形状），其余指标回"未支持"明示；
-- 每个响应带 X-Synthetic-Data 头；只读红线：无任何写端点。
+- 每个响应带 X-Synthetic-Data 头；只读红线：无任何写端点；
+- 持久化装配（P0 热修）：有 DATABASE_URL → freshness/audit 落 PG 真身（pg_store），
+  无 → 内存替身（本地开发不炸）。启用 PG 后 freshness 需先登记，空库=全线 unknown 拒答。
 """
 from __future__ import annotations
 
@@ -17,6 +19,7 @@ from fastapi.responses import JSONResponse
 from app.data_plane.audit import Audit, InMemoryAudit
 from app.data_plane.freshness import FreshnessInfo, FreshnessRouter
 from app.data_plane.governance import Governance, StaticPolicy, UserContext
+from app.data_plane.pg_store import PgAuditStore, PgFreshnessRegistry, database_url
 from app.data_plane.query_runner import QueryRunner
 from app.data_plane.semantic import Semantic, StaticYaml
 from app.data_plane.tools_mcp import DataTools
@@ -120,8 +123,14 @@ def build_tools() -> DataTools:
     tables["oil_production_daily"]["metrics"] = ["产量完成率", "商品量"]
     gov = Governance(StaticPolicy(POLICY))
     sem = Semantic(StaticYaml.default())
-    audit = Audit(store=InMemoryAudit(), runner=engine, clock=_Clock())
-    router = FreshnessRouter(semantic=sem, freshness=_Reg(tables), clock=_Clock())
+    dsn = database_url()
+    if dsn:  # P0 持久化热修：真身落 PG；未配置回落内存替身（本地开发不炸）
+        audit = Audit(store=PgAuditStore(dsn), runner=engine, clock=_Clock())
+        fresh = PgFreshnessRegistry(dsn)
+    else:
+        audit = Audit(store=InMemoryAudit(), runner=engine, clock=_Clock())
+        fresh = _Reg(tables)
+    router = FreshnessRouter(semantic=sem, freshness=fresh, clock=_Clock())
     runner = QueryRunner(catalog=None, engines=[engine], governance=gov)
     return DataTools(governance=gov, semantic=sem, runner=runner, router=router,
                      audit=audit, catalog_tables=tables,

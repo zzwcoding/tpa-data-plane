@@ -1,6 +1,7 @@
 """dp7 快照审计与回放（S1 切片）：结论绑定快照四元组，绝不静默换快照。
 
-- AuditStore seam：S1=InMemoryAudit（S2 对账作业/S3 集团审计面留位）；
+- AuditStore seam：内存版（InMemoryAudit）=测试替身（PRD 裁决 #1），真身=pg_store.PgAuditStore
+  （P0 持久化热修，docs/adr/0002）；S2 对账作业/S3 集团审计面留位；
 - record 在作答成功后调用（记录的是"已经给出的答案"），original 随记录钉死；
 - replay 按**记录快照**重跑（边界规则第 6 行），快照被 expire 清理 → SnapshotGoneError
   沿调用链浮出，绝不静默用当前快照替代（DP-W-D7-3）。
@@ -8,6 +9,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Protocol
 
 from app.data_plane.semantic import StructuredQuery
 
@@ -35,7 +37,17 @@ class AuditRecord:
     original: list
 
 
+class AuditStore(Protocol):
+    """AuditStore seam 合同：put/get；InMemoryAudit=测试替身，PgAuditStore=PG 真身。"""
+
+    def put(self, record: AuditRecord) -> None: ...
+    def get(self, audit_id: str) -> AuditRecord: ...
+
+
 class InMemoryAudit:
+    """测试替身（PRD 裁决 #1）：内存 dict，进程重启即失——仅供测试/无 PG 本地兜底；
+    真身=pg_store.PgAuditStore。"""
+
     def __init__(self):
         self._records: dict[str, AuditRecord] = {}
 
@@ -49,7 +61,7 @@ class InMemoryAudit:
 
 
 class Audit:
-    def __init__(self, *, store: InMemoryAudit, runner, clock, retention: RetentionPolicy | None = None):
+    def __init__(self, *, store: AuditStore, runner, clock, retention: RetentionPolicy | None = None):
         self.store = store
         self.runner = runner
         self.clock = clock
