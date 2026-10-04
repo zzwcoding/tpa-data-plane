@@ -1,0 +1,5 @@
+well_id,well_name,well_type,first_prod_date,platform,block_name,field_name,current_status,remarks
+N-01,渤南01,EW,2020-01-01,CEP-C,渤南,渤南油田,生产中,
+N-02,渤南02,EW,2020-01-01,CEP-C,渤南,渤南油田,生产中,
+Z-01,渤中01,EW,2020-01-01,CEP-A,渤中,渤中油田,生产中,
+Z-02,渤中02,EW,2020-01-01,CEP-A,渤中,渤中油田,生产中,

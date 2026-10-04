@@ -7,7 +7,7 @@ import pyarrow as pa
 import pytest
 
 from app.data_plane.freshness import FreshnessInfo
-from app.data_plane.ingest import FreshnessRegistry, Ingest, Provenance
+from app.data_plane.ingest import InMemoryFreshnessRegistry, Ingest, Provenance
 from app.data_plane.transform import RULES_OIL_DAILY, validate_batch
 
 
@@ -42,7 +42,7 @@ class MemCatalog:
         return self._cat.append(table, arrow, commit_meta)
 
 
-class MemFreshness(FreshnessRegistry):
+class MemFreshness(InMemoryFreshnessRegistry):
     def __init__(self):
         self._reg = {}
 
@@ -98,3 +98,34 @@ class TestBatchIngest:
         """DP-W-D2-2：spec 形状（S1 零实装）。"""
         spec = ingest[0].cdc_pipeline_spec("oltp", ["oil_production_daily"])
         assert spec.sink_semantics.startswith("at-least-once") or "exactly-once" in spec.sink_semantics
+
+
+class TestFailClosedGate:
+    """DP-01 收口（P2-01 盘点 A2-1/A2-6）：替身不许顶正式名；无规则=拒绝入湖。"""
+
+    def test_no_alias_under_historical_name(self):
+        """别名删除咬合：InMemory 替身不许顶在 FreshnessRegistry 正式名下（A2-1）。"""
+        import app.data_plane.ingest as ingest_mod
+        assert not hasattr(ingest_mod, "FreshnessRegistry"), \
+            "替身兼容别名 FreshnessRegistry 已删除（DP-01），不许复活"
+
+    def test_unruled_table_rejected_not_appended(self):
+        """fail-closed：表不在规则清单 → 显式拒绝入湖，append 不发生（A2-6，DP-W-D2-1）。"""
+        from app.data_plane.ingest import UnruledTableRejected
+        cat = MemCatalog()
+        ing = Ingest(catalog=cat, freshness=MemFreshness())  # 未配任何规则集
+        with pytest.raises(UnruledTableRejected) as ei:
+            ing.run_batch_load("oil_production_daily", dirty_batch(dup_at_end=False),
+                               Provenance(quality_report_id="r0", operator="阿强"))
+        assert not cat.committed  # 免检批未入湖
+        assert ei.value.table == "oil_production_daily"
+
+    def test_empty_rules_list_rejected_too(self):
+        """fail-closed 边界：规则清单为空列表 = 同样无闸可用 → 拒绝。"""
+        from app.data_plane.ingest import UnruledTableRejected
+        cat = MemCatalog()
+        ing = Ingest(catalog=cat, freshness=MemFreshness(), rules={"oil_production_daily": []})
+        with pytest.raises(UnruledTableRejected):
+            ing.run_batch_load("oil_production_daily", dirty_batch(dup_at_end=False),
+                               Provenance(quality_report_id="r0", operator="阿强"))
+        assert not cat.committed

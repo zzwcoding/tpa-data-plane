@@ -1,7 +1,9 @@
 """P0 持久化热修集成测试：PG 真身（PgFreshnessRegistry / PgAuditStore）。
 
 - 无 TEST_DATABASE_URL 或未安装 psycopg 时整文件 skip——CI/本地默认全绿；
-- 用表即生产表名（freshness_registry / audit_record），每用例先 DROP 重建，需独占测试库。
+- 用表即生产表名（freshness_registry / audit_record），每用例先 DROP 重建，需独占测试库；
+- DP-01 处置：保留 skip 机制不强求容器化（挂观察，Docker 环境批另立）——
+  跑本模块需 TEST_DATABASE_URL 指向可写 PG 环境。
 """
 from __future__ import annotations
 

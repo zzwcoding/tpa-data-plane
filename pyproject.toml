@@ -1,0 +1,8 @@
+# tpa-data-plane 数据面仓自有配置（嵌套独立 git 仓）。
+# pytest 配置在此锚定 rootdir：阻断向上拾取主仓 pyproject.toml 的
+# [tool.pytest.ini_options]（其 pythonpath=["."] 会把 import app 解析到主平台 app 包，
+# 导致本仓 14 个测试文件收集错误——P2-01 盘点 4.3：两仓现状下无可跑命令，本配置收口）。
+# 验收跑法：在本仓根目录 `python3 -m pytest -q` 直接可跑。
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

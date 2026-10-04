@@ -1,0 +1,5 @@
+equip_id,equip_type,load,current,stop_reason_code
+EQ-N-01,螺杆泵,55.0,23.0,RUNNING
+EQ-N-02,螺杆泵,60.0,24.5,RUNNING
+EQ-Z-01,螺杆泵,65.0,26.0,RUNNING
+EQ-Z-02,螺杆泵,70.0,27.5,RUNNING

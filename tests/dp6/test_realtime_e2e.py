@@ -1,24 +1,21 @@
-"""S2-04 · dp6 realtime 分支实数据联测：fieldforge 亚日读数注册 realtime 档。
+"""S2-04 · dp6 realtime 分支实数据联测：亚日读数注册 realtime 档。
 
 - 日内窗 × 可加指标（realtime 档）→ 答实时面 + 事故 13 口径差异声明；
 - 规则 11（零值 2 小时 = 15 分钟档 8 连零）在亚日数据上机判启用（DP-W-D2-4 闭环）。
-数据源：本地 fieldforge out-tpa 的 sensor_reading_subdaily.csv（缺席则跳过，云上全量跑）。
+数据源：tests/fixtures/fieldforge/sensor_reading_subdaily.csv 仓内合成最小集
+（DP-01 fixture 化，形状同 fieldforge 产物；不再依赖本机外部路径，CI hermetic）。
 """
 from __future__ import annotations
 
 from datetime import date, datetime
 from pathlib import Path
 
-import pytest
-
 from app.data_plane.freshness import FreshnessInfo, FreshnessRouter
 from app.data_plane.semantic import Semantic, StaticYaml
 
 
 
-SUB = Path.home() / "Downloads" / "fieldforge" / "out-tpa" / "sensor_reading_subdaily.csv"
-
-pytestmark = pytest.mark.skipif(not SUB.is_file(), reason="亚日数据不在本机（CI 跳过）")
+SUB = Path(__file__).resolve().parents[1] / "fixtures" / "fieldforge" / "sensor_reading_subdaily.csv"
 
 
 class Clock:

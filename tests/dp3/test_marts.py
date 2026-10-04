@@ -1,4 +1,8 @@
-"""S2-02 · dp3 marts 三张示范模型测试：build_marts 物化 + lineage + dp4 对齐闸。"""
+"""S2-02 · dp3 marts 三张示范模型测试：build_marts 物化 + lineage + dp4 对齐闸。
+
+数据源：tests/fixtures/fieldforge 仓内合成最小集（DP-01 fixture 化，形状同 fieldforge
+合同产物；不再依赖 ~/Downloads/fieldforge 本机外部路径，CI hermetic）。
+"""
 from __future__ import annotations
 
 from pathlib import Path
@@ -9,13 +13,7 @@ import pytest
 
 from app.data_plane.transform import build_marts, lineage
 
-RUN = Path.home() / "Downloads" / "fieldforge" / "out-tpa"
-NEEDED = ("oil_production_daily", "well_info", "well_overhaul", "well_measures",
-          "injection_connection", "monthly_settlement")
-
-pytestmark = pytest.mark.skipif(
-    not all((RUN / f"{t}.csv").is_file() for t in NEEDED),
-    reason="fieldforge 合同产物不在本机（CI 跳过）")
+RUN = Path(__file__).resolve().parents[1] / "fixtures" / "fieldforge"
 
 
 @pytest.fixture(scope="module")

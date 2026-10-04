@@ -1,11 +1,10 @@
-"""票 10 · 老王问数 tracer bullet（端到端）：fieldforge 真实产物 → 进料 → 问数 → AnswerBundle。
+"""票 10 · 老王问数 tracer bullet（端到端）：fixture 产物 → 进料 → 问数 → AnswerBundle。
 
-数据源：本地重生成 fieldforge 合同产物（同 seed 与云端一致，字节级可复现）。
-CI 兼容：fieldforge 不在本机路径时跳过（云上/开发机全量跑）。
+数据源：tests/fixtures/fieldforge 仓内合成最小集（DP-01 fixture 化，形状同 fieldforge
+合同产物；不再依赖 ~/Downloads/fieldforge 本机外部路径，CI hermetic 全量跑）。
 """
 from __future__ import annotations
 
-import subprocess
 from datetime import date
 from pathlib import Path
 
@@ -14,33 +13,15 @@ import pytest
 from app.data_plane.audit import Audit, InMemoryAudit
 from app.data_plane.freshness import FreshnessRouter, FreshnessInfo
 from app.data_plane.governance import Governance, StaticPolicy, UserContext
-from app.data_plane.ingest import FreshnessRegistry, Ingest, Provenance
+from app.data_plane.ingest import InMemoryFreshnessRegistry, Ingest, Provenance
 from app.data_plane.transform import RULES_OIL_DAILY
 from app.data_plane.lake_store import InMemoryLake
 from app.data_plane.query_runner import QueryRunner
 from app.data_plane.semantic import Semantic, StaticYaml
 from app.data_plane.tools_mcp import DataTools
 
-FF = Path.home() / "Downloads" / "fieldforge"
-RECIPE = FF / "recipes" / "tpa_s1_demo.yaml"
-RUN = Path.home() / "Downloads" / "fieldforge" / "out-tpa"
+RUN = Path(__file__).resolve().parents[1] / "fixtures" / "fieldforge"
 TODAY = date(2026, 9, 27)
-
-NEEDED = ("oil_production_daily", "well_info", "monthly_settlement",
-          "injection_connection", "fluid_test", "equip_status", "well_overhaul",
-          "well_measures")
-
-pytestmark = pytest.mark.skipif(
-    not (RECIPE.is_file() and all((RUN / f"{t}.csv").is_file() for t in NEEDED)),
-    reason="fieldforge 合同产物不在本机（CI 跳过；开发机/云上全量跑）")
-
-
-def _ensure_fresh_run():
-    if all((RUN / f"{t}.csv").is_file() for t in NEEDED):
-        return
-    subprocess.run(["python3", "-m", "fieldforge", "generate",
-                    "--recipe", str(RECIPE), "--out", str(RUN)],
-                   cwd=FF, check=True)
 
 
 class Clock:
@@ -49,7 +30,7 @@ class Clock:
 
 
 class RealRunner:
-    """dp5 真实引擎：DuckDB 直读 fieldforge CSV（tpa S1 档查询形态）。"""
+    """dp5 真实引擎：DuckDB 直读 fixture CSV（tpa S1 档查询形态）。"""
     engine = "duckdb"
 
     def execute(self, query, snapshot_id=None, guard=None):
@@ -70,7 +51,6 @@ class RealRunner:
 
 @pytest.fixture(scope="module")
 def tools():
-    _ensure_fresh_run()
     lake = InMemoryLake()
     cat = lake.load_catalog("jdbc")
     policy = {"join_whitelist": [
@@ -81,9 +61,10 @@ def tools():
     sem = Semantic(StaticYaml.default())
     query_runner = QueryRunner(catalog=cat, engines=[RealRunner()], governance=gov)
     audit = Audit(store=InMemoryAudit(), runner=query_runner, clock=Clock())
-    reg = FreshnessRegistry()
-    ing = Ingest(catalog=cat, freshness=reg)
-    # 进料：真实 fieldforge 产物逐表入湖（油表带质检）
+    reg = InMemoryFreshnessRegistry()
+    ing = Ingest(catalog=cat, freshness=reg,
+                 rules={"oil_production_daily": RULES_OIL_DAILY})  # fail-closed：入湖必配规则集
+    # 进料：fixture 产物油表带质检闸入湖（DP-01 fail-closed 后无规则=拒绝）
     import csv
 
     def load_csv(name):
@@ -98,7 +79,7 @@ def tools():
     ing.run_batch_load("oil_production_daily", cleaned,
                        Provenance(quality_report_id=report.report_id, operator="laowang"))
     for t in ("well_info", "monthly_settlement", "injection_connection", "fluid_test"):
-        reg.register(t, "offline", date(2026, 9, 26), f"fieldforge-{t}")
+        reg.register(t, "offline", date(2026, 9, 26), f"fixture-{t}")
     router = FreshnessRouter(semantic=sem, freshness=reg, clock=Clock())
     runner = query_runner
     tables = {t: {"tier": "offline", "freshness": "2026-09-26", "metrics": []}
