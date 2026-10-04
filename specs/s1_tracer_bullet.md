@@ -47,7 +47,7 @@
 
 | 模块 | S1 实现 | 留位（不实装） |
 |---|---|---|
-| dp1 | PyIceberg SqlCatalog（JDBC→postgres）+ MinIO；InMemoryLake 测试替身 | rest/federated backend |
+| dp1 | PyIceberg SqlCatalog（JDBC→postgres）+ MinIO；内存测试替身〔DP-03 已移除：拍板 3 湖=中台库 schema＋MinIO〕 | rest/federated backend |
 | dp2 | run_batch_load + register_freshness/freshness（offline 档） | cdc_pipeline_spec 实装（形状返回） |
 | dp3 | 质量闸框架 + 规则 1/2/3/5 对象 + rule_mapping + lineage 最小 | 规则 4/6-12 精化（S2）、13–20 重建（S2） |
 | dp4 | StaticYaml 15 指标卡 + resolve_term 四类 + build_query 四件套/消歧 + authoritative_source | Cube |

@@ -1,16 +1,25 @@
-"""dp2 进料与新鲜度（S1 切片）：validate→append→register 三步契约。
+"""dp2 进料与新鲜度（DP-03 真链路）：validate→append→register 三步契约接湖真身。
 
 - 闸在编排层：validate_batch 先行（不合格 raise BatchRejected，append 不发生——DP-W-D2-1）；
   表未配规则集=同样拒绝（UnruledTableRejected，fail-closed：无规则不许免检入湖，DP-01 收口）；
 - run_batch_load 以 dp2.ingest 身份调 dp1.append（写面白名单），provenance 随 commit 落元数据；
+  真身=LakeCatalog（PG raw schema＋MinIO 原始文件——DP-03 方案 C1，替身湖已物理移除）；
+- **CSV 绕全链退役（DP-03）**：run_csv_load 把 run 目录 CSV 的读取路径收编为「进料输入」
+  （fieldforge 产物 CSV→进料管道→raw schema），消费面不经 CSV 直查——湖 scan/SQL 只读 raw 层；
+  manifest 血缘随 commit 登记（dp3 transform.py 的 manifest 格式沿用：metadata/nodes/
+  parent_map/child_map，落 data_plane.lake_snapshot.manifest）；
 - FreshnessRegistry seam：内存版（InMemoryFreshnessRegistry）=测试替身（PRD 裁决 #1），
-  真身=pg_store.PgFreshnessRegistry（P0 持久化热修，docs/adr/0002）；同表多管道取 as_of 最新；
+  真身=pg_store.PgFreshnessRegistry（P0 持久化热修，docs/adr/0002；DP-03 归位 data_plane schema）；
+  同表多管道取 as_of 最新；
 - cdc_pipeline_spec 只产形状（S2 零实装）。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
+
+import pyarrow as pa
 
 from app.data_plane.freshness import FreshnessInfo
 
@@ -73,7 +82,27 @@ class Ingest:
         self._registry = freshness      # FreshnessRegistry seam（替身|PG 真身）；名字避开 freshness() 方法（属性冲突教训）
         self._rules = rules or {}       # 表 → 质量规则清单（入湖必过质检）
 
-    def run_batch_load(self, table: str, records, provenance: Provenance):
+    def run_batch_load(self, table: str, records, provenance: Provenance,
+                       *, source: str | None = None, batch_id: str | None = None):
+        """批量进料（内存/Arrow 记录形态）；batch_id/source 透传快照账（血缘与幂等寻址用）。"""
+        return self._load(table, records, provenance, source=source, batch_id=batch_id)
+
+    def run_csv_load(self, table: str, csv_path, provenance: Provenance,
+                     *, source: str | None = None, batch_id: str | None = None):
+        """CSV 进料（DP-03：run 目录 CSV 的读取路径收编为「进料输入」）。
+
+        - CSV 全列按文本读入（as-is：CSV 本是文本，定型发生在 raw 结构化落库的显式转换）；
+        - source 缺省取 `<父目录名>/<文件名>`（fieldforge 产物 run 目录的自然标识），
+          manifest 血缘 source 节点随之登记——数据只经本管道进湖，不经 CSV 直查。"""
+        path = Path(csv_path)
+        names = pa.csv.read_csv(path).column_names
+        as_text = pa.csv.read_csv(path, convert_options=pa.csv.ConvertOptions(
+            column_types={n: pa.string() for n in names}))  # as-is：CSV 全列文本读入
+        src = source or f"{path.parent.name}/{path.name}"
+        return self._load(table, as_text, provenance, source=src, batch_id=batch_id)
+
+    def _load(self, table: str, records, provenance: Provenance,
+              *, source: str | None, batch_id: str | None):
         rules = self._rules.get(table)
         if not rules:  # fail-closed（DP-W-D2-1）：表不在规则清单/规则清单为空=无闸可用，拒绝入湖
             raise UnruledTableRejected(table)
@@ -84,9 +113,13 @@ class Ingest:
         records = cleaned
         cat = self.catalog.cat if hasattr(self.catalog, "cat") else self.catalog
         cat.begin_caller("dp2.ingest")  # 写面白名单声明（DP-W-D1-4）
-        snap = cat.append(table, records, commit_meta={"provenance": {
-            "quality_report_id": provenance.quality_report_id,
-            "operator": provenance.operator}})
+        batch_id = batch_id or f"b-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        snap = cat.append(table, records, commit_meta={
+            "provenance": {"quality_report_id": provenance.quality_report_id,
+                           "operator": provenance.operator},
+            "source": source,
+            "batch_id": batch_id,
+            "manifest": _lineage_manifest(table, batch_id, source, records.column_names)})
         self._registry.register(table, tier="offline",
                                 as_of=_committed_as_of(), pipeline="batch-shift-report")
         return snap
@@ -101,6 +134,22 @@ class Ingest:
         return FlinkJobSpec(variant="pipeline", source_db=source_db, tables=tuple(tables),
                             sink_semantics="at-least-once + 主键幂等（源表必须有主键）",
                             config_ref="deploy/flink/cdc.pipeline.yaml（S2 形状，零实装）")
+
+
+def _lineage_manifest(table: str, batch_id: str, source: str | None,
+                      columns) -> dict:
+    """进料血缘 manifest（dp3 transform.py 的 manifest 格式沿用）：
+    湖表节点 model.petro.<table> ← 进料输入 source.petro.<source>，parent_map/child_map 互逆。"""
+    model = f"model.petro.{table}"
+    src = f"source.petro.{source or 'manual-batch'}"
+    return {
+        "metadata": {"tool": "tpa-dp2-ingest", "version": "0.1.0",
+                     "table": table, "batch_id": batch_id},
+        "nodes": {model: {"columns": list(columns), "resource_type": "model"},
+                  src: {"resource_type": "source"}},
+        "parent_map": {model: [src]},
+        "child_map": {src: [model]},
+    }
 
 
 def _committed_as_of() -> datetime:

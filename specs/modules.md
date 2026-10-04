@@ -31,7 +31,7 @@ dp9 ← dp5, dp8
   - `Catalog.append(table: str, arrow: ArrowTable, commit_meta: dict) -> SnapshotInfo`（**仅 dp2/dp3 可调**）
   - `TableRef.metrics() -> ColumnStats`
 - **依赖**：无（最底层）；外部=MinIO/S3、PyIceberg SqlCatalog（JDBC→云上 postgres）
-- **Seam/Adapter**：`Catalog`/`TableRef` 抽象；测试替身 `InMemoryLake`、`FakeCatalog`
+- **Seam/Adapter**：`Catalog`/`TableRef` 抽象；测试替身（原内存替身〔DP-03 移除，替身位在测试 conftest〕）、`FakeCatalog`
 - **测试计划**：DP-W-D1-1…4（schema 四件齐/快照隔离/谓词列裁剪/写面越界审计）
 
 ## dp2

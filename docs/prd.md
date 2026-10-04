@@ -129,7 +129,7 @@ Python 3.12 · PyIceberg（湖表）· DuckDB（S1 引擎）· PyArrow（数据�
 
 | # | 差距 | 裁决 |
 |---|---|---|
-| 1 | Fake 件清单（InMemoryLake/StaticFreshness/FakeDbt/FakeCube/RecordedEngine/FakeClock/InMemoryAudit/StaticPolicy） | ✅ 全部保留为**测试替身**（Seam 设计意图），真实实现另写——测试双轨 |
+| 1 | Fake 件清单（湖内存替身〔DP-03 移除〕/StaticFreshness/FakeDbt/FakeCube/RecordedEngine/FakeClock/InMemoryAudit/StaticPolicy） | ✅ 全部保留为**测试替身**（Seam 设计意图），真实实现另写——测试双轨 |
 | 2 | date_dim 表不存在 | ✅ 数据面自建日期维（进料时派生），不改 fieldforge |
 | 3 | 配产表不存在（指标 1 依赖） | ✅ **S1 派生占位**：月度配产 = oil_production_daily.plan_output 按区块月聚合（plan_output 列已存在）；fieldforge 新增正式配产表另票 |
 | 4 | 受效关系实体不存在 | ✅ **已解决**：fieldforge injection_connection（65 组，Σ=1）已供给 |

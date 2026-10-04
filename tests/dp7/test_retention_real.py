@@ -1,11 +1,17 @@
-"""S2-03 · dp7 快照保留实跑：expire 真链路（非 mock raise）→ replay SnapshotGoneError。"""
+"""S2-03 · dp7 快照保留实跑：expire 真链路（非 mock raise）→ replay SnapshotGoneError。
+
+DP-03：旧湖替身类已物理移除——本链改用 tests/conftest 的 FakeSnapshotCatalog
+（seam 合法位，按快照存表＋expire 清可见性）；expire 的湖真身语义（PG 快照账＋BoundaryViolation
+白名单）在 tests/dp1/test_lake_store.py 实跑机判。Runner 走 dp1 按快照 scan 的链路照旧非 mock。"""
 from __future__ import annotations
 
 import pyarrow as pa
 import pytest
 
 from app.data_plane.audit import Audit, InMemoryAudit, RetentionPolicy, StructuredQuery
-from app.data_plane.lake_store import InMemoryLake, SnapshotGoneError
+from app.data_plane.lake_store import SnapshotGoneError
+
+from tests.conftest import FakeSnapshotCatalog
 
 
 def q():
@@ -33,8 +39,7 @@ class Clock:
 
 @pytest.fixture()
 def env():
-    lake = InMemoryLake()
-    cat = lake.load_catalog("jdbc")
+    cat = FakeSnapshotCatalog()
     cat.begin_caller("dp2.ingest")
     cat.create_table("t", schema=pa.Table.from_pylist([{"v": 0}]).schema)
     audit = Audit(store=InMemoryAudit(), runner=Runner(cat), clock=Clock(),

@@ -4,7 +4,9 @@
 - 公开签名与内存替身一致：register/freshness（dp2）、put/get（dp7）——构造注入即可互换；
 - 连接走 DATABASE_URL 环境变量；未设置时装配点回落内存替身（本地开发不炸），
   已设但未装 psycopg = 显式报错（不静默降级丢持久化）；
-- 建表幂等（CREATE TABLE IF NOT EXISTS），实例构造时自动 ensure_schema。
+- 建表幂等（CREATE TABLE IF NOT EXISTS），实例构造时自动 ensure_schema；
+- 【DP-03 归位】两表落**数据面自有 schema `data_plane`**（Owner 拍板 2：中台库归数据面
+  全权；三层 schema=raw/clean/data_plane，规范结构=migrations/001，此处幂等 ensure 同形兜底）。
 """
 from __future__ import annotations
 
@@ -16,15 +18,18 @@ from datetime import date, datetime
 from app.data_plane.audit import AuditRecord, StructuredQuery  # StructuredQuery 原 dp4 定义，裁决 15 归位后落位 audit.py（DP-02）
 from app.data_plane.freshness import FreshnessInfo
 
-_DDL = """
-CREATE TABLE IF NOT EXISTS freshness_registry (
+_SCHEMA = "data_plane"
+
+_DDL = f"""
+CREATE SCHEMA IF NOT EXISTS {_SCHEMA};
+CREATE TABLE IF NOT EXISTS {_SCHEMA}.freshness_registry (
     table_name TEXT PRIMARY KEY,
     tier       TEXT NOT NULL,
     as_of      TIMESTAMP,
     pipeline   TEXT,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
-CREATE TABLE IF NOT EXISTS audit_record (
+CREATE TABLE IF NOT EXISTS {_SCHEMA}.audit_record (
     audit_id         TEXT PRIMARY KEY,
     asked_at         TEXT NOT NULL,
     query            JSONB NOT NULL,
@@ -76,8 +81,8 @@ class PgFreshnessRegistry:
     def register(self, table: str, tier: str, as_of, pipeline: str) -> None:
         with _connect(self._dsn) as conn, conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO freshness_registry AS f (table_name, tier, as_of, pipeline)
+                f"""
+                INSERT INTO {_SCHEMA}.freshness_registry AS f (table_name, tier, as_of, pipeline)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (table_name) DO UPDATE
                     SET tier = EXCLUDED.tier, as_of = EXCLUDED.as_of,
@@ -89,7 +94,8 @@ class PgFreshnessRegistry:
 
     def freshness(self, table: str) -> FreshnessInfo:
         with _connect(self._dsn) as conn, conn.cursor() as cur:
-            cur.execute("SELECT tier, as_of, pipeline FROM freshness_registry WHERE table_name = %s",
+            cur.execute(f"SELECT tier, as_of, pipeline FROM {_SCHEMA}.freshness_registry "
+                        "WHERE table_name = %s",
                         (table,))
             row = cur.fetchone()
         if row is None:
@@ -114,8 +120,8 @@ class PgAuditStore:
     def put(self, record: AuditRecord) -> None:
         with _connect(self._dsn) as conn, conn.cursor() as cur:
             cur.execute(
-                """
-                INSERT INTO audit_record
+                f"""
+                INSERT INTO {_SCHEMA}.audit_record
                     (audit_id, asked_at, query, snapshot_id, semantic_version,
                      quality_status, original)
                 VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s::jsonb)
@@ -134,9 +140,9 @@ class PgAuditStore:
     def get(self, audit_id: str) -> AuditRecord:
         with _connect(self._dsn) as conn, conn.cursor() as cur:
             cur.execute(
-                """SELECT asked_at, query, snapshot_id, semantic_version, quality_status,
+                f"""SELECT asked_at, query, snapshot_id, semantic_version, quality_status,
                           original
-                   FROM audit_record WHERE audit_id = %s""", (audit_id,))
+                   FROM {_SCHEMA}.audit_record WHERE audit_id = %s""", (audit_id,))
             row = cur.fetchone()
         if row is None:
             raise KeyError(f"审计记录不存在：{audit_id}")
