@@ -50,10 +50,10 @@ def catalog():
     _purge_objects(cat)
 
 
-def _purge_objects(cat):
+def _purge_objects(cat, prefix: str | None = None):
     boss = boto3.client("s3", endpoint_url=ENDPOINT, aws_access_key_id=ACCESS_KEY,
                         aws_secret_access_key=SECRET_KEY)
-    resp = boss.list_objects_v2(Bucket=BUCKET, Prefix=f"{TABLE}/")
+    resp = boss.list_objects_v2(Bucket=BUCKET, Prefix=prefix or f"{TABLE}/")
     for obj in resp.get("Contents", []):
         boss.delete_object(Bucket=BUCKET, Key=obj["Key"])
 
@@ -76,7 +76,8 @@ class TestSchema:
 
 class TestAppendAndSnapshots:
     def test_append_isolation(self, catalog):
-        """DP-W-D1-2：两次 append，按旧快照读=旧视图（不脏读，PG 行级 _snapshot_id 寻址）。"""
+        """DP-W-D1-2：append-only＋快照隔离——as-of 时点视图（DP-03.fix F1：快照 N＝截至 N
+        的生效全视图，不是 delta 本批切片；本探针表未登记业务键→时点过滤＝累积全量）。"""
         catalog.create_table(TABLE, schema=sample(1).schema)
         catalog.begin_caller("dp2.ingest")
         t = catalog.load_table(TABLE)
@@ -84,9 +85,9 @@ class TestAppendAndSnapshots:
         assert t.scan(snapshot_id=s1.snapshot_id).num_rows == 2
         s2 = catalog.append(TABLE, sample(1, well="N-02"), {"provenance": {"batch": "b2"}})
         assert s2.snapshot_id != s1.snapshot_id
-        assert t.scan(snapshot_id=s1.snapshot_id).num_rows == 2  # 旧快照仍是 2 行
-        assert t.scan(snapshot_id=s2.snapshot_id).num_rows == 1  # 新快照只含本批
-        assert t.scan().num_rows == 3                            # 当前视图=全量
+        assert t.scan(snapshot_id=s1.snapshot_id).num_rows == 2  # 旧快照仍是 2 行（时点不漂移）
+        assert t.scan(snapshot_id=s2.snapshot_id).num_rows == 3  # as-of：含旧批的全部生效行
+        assert t.scan().num_rows == 3                            # 当前视图=截至当前的生效全量
 
     def test_committed_at_is_real_clock(self, catalog):
         """替身语义缺口补齐：committed_at=真时钟提交时间（DB 时刻、带时区，不再是字面 "now"）。"""
@@ -176,8 +177,105 @@ class TestAppendAndSnapshots:
         t = catalog.load_table(TABLE)
         with pytest.raises(SnapshotGoneError):
             t.scan(snapshot_id=ids[0])
-        assert t.scan(snapshot_id=ids[2]).num_rows == 1
+        assert t.scan(snapshot_id=ids[2]).num_rows == 3  # as-of：截至 ids[2] 的生效行（N-00..N-02）
         assert t.scan().num_rows == 4  # expire 清时间旅行可见性，不动当前数据
+
+
+class TestAsOfTimepointView:
+    """DP-03.fix F1 · as-of 时点视图（L0 裁决：D6 册「增量策略与两坑」坑一——追加模式新旧并存
+    →按批次取最新，不混用）：scan(snapshot_id=N)=截至 N 每业务键的最新生效版；同批并列行全保留
+    （RANK 并列——A/B 班重复行是原始层合法内容）。键口径＝raw 8 表键（lake_store._BUSINESS_KEYS，
+    照抄 migrations/001 表 COMMENT 逻辑键）；本探针借同名 well_info 命中 well_id 键，
+    落独立 raw_dp1_asof schema，零触碰规范 raw 层。"""
+
+    KEYED_SCHEMA = pa.schema([("well_id", pa.string()), ("current_status", pa.string())])
+    BUSINESS = ("well_id", "current_status")
+
+    def _rows(self, *rows):
+        return pa.Table.from_pylist(list(rows), schema=self.KEYED_SCHEMA)
+
+    @pytest.fixture()
+    def keyed(self):
+        cat = load_catalog(dsn=TEST_DSN, s3_endpoint=ENDPOINT, s3_access_key=ACCESS_KEY,
+                           s3_secret_key=SECRET_KEY, bucket=BUCKET, raw_schema="raw_dp1_asof")
+        with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS raw_dp1_asof CASCADE")
+            cur.execute("DELETE FROM data_plane.lake_snapshot WHERE table_name = 'well_info'")
+        _purge_objects(cat, prefix="well_info/")
+        yield cat
+        with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
+            cur.execute("DROP SCHEMA IF EXISTS raw_dp1_asof CASCADE")
+            cur.execute("DELETE FROM data_plane.lake_snapshot WHERE table_name = 'well_info'")
+        _purge_objects(cat, prefix="well_info/")
+
+    def _seed_two_batches(self, cat):
+        cat.create_table("well_info", schema=self.KEYED_SCHEMA, comment="as-of 探针（键=well_id）")
+        cat.begin_caller("dp2.ingest")
+        s1 = cat.append("well_info", self._rows(
+            {"well_id": "N-01", "current_status": "生产中"},
+            {"well_id": "N-02", "current_status": "生产中"}), {"provenance": {"batch": "b1"}})
+        s2 = cat.append("well_info", self._rows(
+            {"well_id": "N-01", "current_status": "停产"}), {"provenance": {"batch": "b2"}})
+        return s1, s2
+
+    @staticmethod
+    def _view(table, snapshot_id):
+        return sorted(table.scan(snapshot_id=snapshot_id)
+                      .select(list(TestAsOfTimepointView.BUSINESS)).to_pylist(),
+                      key=lambda r: r["well_id"])
+
+    def test_same_key_newer_batch_supersedes(self, keyed):
+        """新旧两版同键只见到新版：跨批同键新版覆盖旧版（不混用），未覆盖键旧批行仍生效。"""
+        s1, s2 = self._seed_two_batches(keyed)
+        t = keyed.load_table("well_info")
+        assert self._view(t, s2.snapshot_id) == [
+            {"well_id": "N-01", "current_status": "停产"},    # 新版（b2 同键覆盖）
+            {"well_id": "N-02", "current_status": "生产中"}]  # b1 未覆盖键照常生效
+        assert t.scan().num_rows == 2  # 当前视图=截至当前的生效视图（非逐批累积 3 行）
+
+    def test_older_snapshot_still_sees_old_version(self, keyed):
+        """N 之前时点见旧版：时间旅行不漂移（dp7 同快照重放一致的底座）。"""
+        s1, _s2 = self._seed_two_batches(keyed)
+        t = keyed.load_table("well_info")
+        assert self._view(t, s1.snapshot_id) == [
+            {"well_id": "N-01", "current_status": "生产中"},  # 时点在 b2 之前→旧版仍在
+            {"well_id": "N-02", "current_status": "生产中"}]
+
+    def test_same_batch_duplicate_keys_both_kept(self, keyed):
+        """同批并列行全保留：RANK 并列（同 _snapshot_id）不作键内裁决——A/B 班重复行
+        是原始层合法内容（as-is，001 头注）。"""
+        s1, _s2 = self._seed_two_batches(keyed)
+        s3 = keyed.append("well_info", self._rows(
+            {"well_id": "N-01", "current_status": "生产中"},
+            {"well_id": "N-01", "current_status": "生产中"}), {"provenance": {"batch": "b3"}})
+        assert s3.snapshot_id != s1.snapshot_id
+        t = keyed.load_table("well_info")
+        view = t.scan(snapshot_id=s3.snapshot_id).select(list(self.BUSINESS)).to_pylist()
+        assert len(view) == 3  # N-01 两行（同批并列）＋N-02 一行
+        assert sum(1 for r in view if r["well_id"] == "N-01") == 2
+
+    def test_fake_and_real_asof_semantics_agree(self, keyed):
+        """替身/真身语义一致断言：同一 append 序列，FakeSnapshotCatalog 与湖真身的
+        各时点视图逐行相等（conftest 替身 as-of 对齐真身的机判）。"""
+        from tests.conftest import FakeSnapshotCatalog
+        fake = FakeSnapshotCatalog()
+        fake.create_table("well_info", schema=self.KEYED_SCHEMA)
+        fake.begin_caller("dp2.ingest")
+        s1r, s2r = self._seed_two_batches(keyed)          # 真身侧（独立 schema 探针表）
+        fake.append("well_info", self._rows(              # 替身侧同一序列（快照号各自计，按位对齐）
+            {"well_id": "N-01", "current_status": "生产中"},
+            {"well_id": "N-02", "current_status": "生产中"}), {})
+        s1f = 1
+        fake.append("well_info", self._rows(
+            {"well_id": "N-01", "current_status": "停产"}), {})
+        s2f = 2
+        rt, ft = keyed.load_table("well_info"), fake.load_table("well_info")
+        assert self._view(rt, s1r.snapshot_id) == self._view(ft, s1f)
+        assert self._view(rt, s2r.snapshot_id) == self._view(ft, s2f)
+        assert sorted(rt.scan().select(list(self.BUSINESS)).to_pylist(),
+                      key=lambda r: r["well_id"]) == \
+            sorted(ft.scan().select(list(self.BUSINESS)).to_pylist(),
+                   key=lambda r: r["well_id"])
 
 
 class TestRawObjectAndManifest:

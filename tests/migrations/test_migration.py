@@ -127,6 +127,33 @@ def test_up_down_up_roundtrip():
     _run("up")  # 复原到已迁移态（后续湖测试依赖）
 
 
+def test_lake_boot_before_migration_up_still_idempotent():
+    """DP-03.fix F2：湖先 boot（LakeCatalog._ensure_meta 幂等兜底建同名索引）再跑迁移 up
+    不炸——重排序部署场景（湖 boot 先于迁移）的幂等实测。boot 以 _META_DDL 直执行等价复现
+    （_ensure_meta 的湖元数据段；不引 boto3 保持本文件 psycopg-only）。"""
+    _run("down", "--all")  # 未迁移态
+    with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        # 自愈半途失败的残留：账本在但空（上次 up 半途而废）→ down 不再下探，按 001.down
+        # 同口径归零（DROP 三 schema），保证本测试从真正未迁移态起步
+        leftover = cur.execute(
+            "SELECT to_regclass('data_plane.schema_migrations')").fetchone()[0]
+        if leftover is not None:
+            cur.execute("DROP SCHEMA IF EXISTS raw CASCADE")
+            cur.execute("DROP SCHEMA IF EXISTS clean CASCADE")
+            cur.execute("DROP SCHEMA IF EXISTS data_plane CASCADE")
+        assert cur.execute("SELECT to_regclass('data_plane.schema_migrations')").fetchone()[0] is None
+    from app.data_plane.lake_store import _META_DDL
+    with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        cur.execute("CREATE SCHEMA IF NOT EXISTS data_plane")
+        cur.execute(_META_DDL.format(meta="data_plane"))  # 湖先 boot：ensure_meta 兜底（同形 DDL）
+        assert cur.execute("SELECT to_regclass("
+                           "'data_plane.idx_lake_snapshot_table')").fetchone()[0] is not None
+    out = _run("up")  # 迁移后补跑：001 的 CREATE INDEX 若缺 IF NOT EXISTS 在此 DuplicateTable
+    assert "001 applied" in out
+    with psycopg.connect(TEST_DSN) as conn, conn.cursor() as cur:
+        assert set(EXPECTED) <= _tables(cur, "raw")  # 迁移在 boot 之上补齐全量结构
+
+
 def test_midplatform_template_grants_all_eight_tables():
     """验收 3：midplatform 只读账号 SQL 模板在迁移文件旁，且覆盖恰为 8 张源表。"""
     tpl = (MIGRATIONS / "midplatform_readonly.sql").read_text(encoding="utf-8")

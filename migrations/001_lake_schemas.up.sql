@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS data_plane.lake_snapshot (
     manifest        JSONB        NOT NULL,                -- 血缘 manifest（dp3 transform.py 格式沿用：metadata/nodes/parent_map/child_map）
     provenance      JSONB        NOT NULL DEFAULT '{}'::jsonb  -- commit 元数据（质检报告号/操作人）
 );
-CREATE INDEX idx_lake_snapshot_table ON data_plane.lake_snapshot (table_name, snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_lake_snapshot_table ON data_plane.lake_snapshot (table_name, snapshot_id);  -- IF NOT EXISTS=湖先 boot（_ensure_meta 同形兜底）再跑迁移不炸（DP-03.fix F2 幂等）
 COMMENT ON TABLE data_plane.lake_snapshot IS '快照账（append-only；expire 只删行＝清时间旅行可见性，不动当前数据——DP-W-D7-3/RF2-05）';
 
 -- ============ 数据面自有两表（与 pg_store 幂等 DDL 同形；P0 热修起归位自有 schema） ============

@@ -5,8 +5,10 @@
   抛弃不修补——盘点 A1-7 "降级施工"病灶清除）；三 backend（jdbc/rest/federated）假分支随之删除——拍板 3 下不存在
   Iceberg catalog，`load_catalog` 只留真实装配方（换 backend 不换调用方的 seam 承诺由
   Catalog/TableRef 接口形状继续承载，seam 替身位下沉到测试 conftest，不入仓实现）；
-- 语义与原替身契约逐条对齐：append-only／快照隔离（PG 行级 `_snapshot_id` 寻址）／谓词＋
-  列裁剪（下推 SQL WHERE，列名白名单＋参数化值）／写面收敛（append 仅 dp2/dp3，expire 仅
+- 语义与原替身契约逐条对齐：append-only／快照隔离（PG 行级 `_snapshot_id` 寻址；scan＝**as-of
+  时点视图**——快照 N 每业务键取 ≤N 的最新生效版，D6 册「增量策略与两坑」坑一「按批次取最新，
+  不混用」；DP-03.fix F1 L0 裁决回贴原替身/dp7 replay 契约，开发拍的 delta 读语义废弃）／
+  谓词＋列裁剪（下推 SQL WHERE，列名白名单＋参数化值）／写面收敛（append 仅 dp2/dp3，expire 仅
   dp7.retention）／门面**故意不暴露** overwrite/delete/upsert（DP1 底稿 L131-132）；
 - 替身语义缺口补齐：`committed_at`＝真时钟提交时间（DB 时刻，非字面 "now"）；
 - `SnapshotInfo.provenance`＝质检/操作者出处的本体（commit_meta 的 source/batch_id/manifest
@@ -66,6 +68,21 @@ class ColumnStats:
 
 _WRITE_ALLOWED = ("dp2.ingest", "dp3.transform")
 _EXPIRE_ALLOWED = ("dp7.retention",)
+
+# 各湖表业务键（as-of 时点视图的「每键」口径）：照抄 migrations/001 表 COMMENT 登记的逻辑键，
+# 零发明；well_measures「措施次」/equip_status「时间戳」列供给方未定名（001 表 COMMENT 已登记
+# 缺口）→ 键退化到已供给列。未登记表＝无业务键，as-of 退化为纯时点过滤（_snapshot_id ≤ N
+# 全量行——时点视图仍成立，只是无同键新版覆盖）。键列以表内实有列为准取交集。
+_BUSINESS_KEYS: dict[str, tuple[str, ...]] = {
+    "well_info": ("well_id",),                                       # §A.1 逻辑 PK well_id
+    "oil_production_daily": ("well_id", "prod_date"),                # §A.2 逻辑 PK well_id+prod_date
+    "water_injection_daily": ("well_id", "prod_date"),               # §A.3 井号+日期
+    "well_overhaul": ("well_id", "overhaul_start", "overhaul_end"),  # §A.4 井号+起止
+    "well_measures": ("well_id",),                                   # §A.5 井号+措施次（措施次列未供给→退化井号）
+    "fluid_test": ("well_id", "sample_date"),                        # §A.6 井号+取样日期
+    "equip_status": ("equip_id",),                                   # §A.7 设备号+时间戳（时间戳列未供给→退化设备号）
+    "monthly_settlement": ("block_name", "settle_date"),             # §A.8 区块+结算月
+}
 
 _EMPTY_MANIFEST = {"metadata": {"tool": "dp1.append", "version": "0.1.0"},
                    "nodes": {}, "parent_map": {}, "child_map": {}}
@@ -135,20 +152,45 @@ class LakeTableRef:
 
     def scan(self, pred: str | None = None, fields: tuple[str, ...] = (),
              snapshot_id: int | None = None, limit: int | None = None) -> pa.Table:
-        where, params = [], []
-        if snapshot_id is not None:
-            if not self._cat._snapshot_exists(self.name, snapshot_id):
-                raise SnapshotGoneError("快照不存在或已过保留窗口")
-            where.append("_snapshot_id = %s")
-            params.append(snapshot_id)
+        """as-of 时点视图读（DP-03.fix F1）：快照 N＝截至 N 的全表生效视图——每业务键取
+        _snapshot_id ≤ N 的最新版（RANK 并列全保留：同批 A/B 班重复行是合法内容，跨批旧版
+        被新版覆盖不混用——D6 册坑一）。快照账无 N＝SnapshotGoneError，绝不静默回退；
+        谓词在时点视图**坍缩之后**过滤（旧版值不能借谓词翻出来），仍为参数化 SQL＋列名白名单。"""
+        if snapshot_id is not None and not self._cat._snapshot_exists(self.name, snapshot_id):
+            raise SnapshotGoneError("快照不存在或已过保留窗口")
+        bound_sql = "_snapshot_id <= %s" if snapshot_id is not None else None
+        pred_sql, pred_param = None, []
         if pred:
             col, sql_op, value = _parse_pred(pred, self._colset)
             family = dict(self._columns).get(col, "other")
-            where.append(f'"{col}" {sql_op} %s')
-            params.append(_typed_literal(value, family))
-        sql = f'SELECT {self._projection(fields)} FROM "{self._cat.raw_schema}"."{self.name}"'
-        if where:
-            sql += " WHERE " + " AND ".join(where)
+            pred_sql = f'"{col}" {sql_op} %s'
+            pred_param = [_typed_literal(value, family)]
+        key_cols = [c for c in _BUSINESS_KEYS.get(self.name, ()) if c in self._colset]
+        params: list = []
+        if key_cols:
+            # 每业务键取 max(_snapshot_id) 的行：RANK（非 ROW_NUMBER）＝同快照并列行全保留
+            partition = ", ".join(f'"{c}"' for c in key_cols)
+            sql = (f'SELECT {self._projection(fields)} FROM ('
+                   f'SELECT *, RANK() OVER (PARTITION BY {partition} '
+                   f'ORDER BY _snapshot_id DESC) AS _dp_asof_rk '
+                   f'FROM "{self._cat.raw_schema}"."{self.name}"')
+            inner_where = [bound_sql] if bound_sql else []
+            params += [snapshot_id] if snapshot_id is not None else []
+            if inner_where:
+                sql += " WHERE " + " AND ".join(inner_where)
+            sql += ") _dp_asof WHERE _dp_asof_rk = 1"  # _dp_asof_rk：窗口排名别名（`_` 前缀不外露）
+            if pred_sql:
+                sql += " AND " + pred_sql
+                params += pred_param
+        else:
+            sql = f'SELECT {self._projection(fields)} FROM "{self._cat.raw_schema}"."{self.name}"'
+            where = [bound_sql] if bound_sql else []
+            params += [snapshot_id] if snapshot_id is not None else []
+            if pred_sql:
+                where.append(pred_sql)
+                params += pred_param
+            if where:
+                sql += " WHERE " + " AND ".join(where)
         if limit is not None:
             sql += f" LIMIT {int(limit)}"
         rows = self._cat._fetch(sql, params)
@@ -156,10 +198,11 @@ class LakeTableRef:
                                     schema=self._arrow_schema(fields))
 
     def metrics(self) -> ColumnStats:
-        numeric = [c for c, t in self._columns if _pg_family(t) == "numeric"]
-        agg_sql, aggs = [], []
-        for c in self._colset:
-            agg_sql.append(f'count(*) FILTER (WHERE "{c}" IS NULL)')
+        """列级 null/min/max——业务列视图（`_` 前缀湖管道列不计入，与 schema() 口径一致，
+        DP-03.fix F4-④）。"""
+        business = [(c, t) for c, t in self._columns if not c.startswith("_")]
+        numeric = [c for c, t in business if _pg_family(t) == "numeric"]
+        agg_sql = [f'count(*) FILTER (WHERE "{c}" IS NULL)' for c, _ in business]
         for c in numeric:
             agg_sql += [f'min("{c}")', f'max("{c}")']
         if not agg_sql:
@@ -167,7 +210,7 @@ class LakeTableRef:
         row = self._cat._fetch_one(
             f'SELECT {", ".join(agg_sql)} FROM "{self._cat.raw_schema}"."{self.name}"')
         nulls, min_max = {}, {}
-        cols = list(self._colset)
+        cols = [c for c, _ in business]
         for i, c in enumerate(cols):
             nulls[c] = int(row[i] or 0)
         base = len(cols)

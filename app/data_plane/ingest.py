@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import io
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -95,7 +97,9 @@ class Ingest:
         - source 缺省取 `<父目录名>/<文件名>`（fieldforge 产物 run 目录的自然标识），
           manifest 血缘 source 节点随之登记——数据只经本管道进湖，不经 CSV 直查。"""
         path = Path(csv_path)
-        names = pa.csv.read_csv(path).column_names
+        with open(path, "rb") as f:  # 表头行嗅探定列名（DP-03.fix F4-③：全文只读一遍）
+            header = f.readline()
+        names = pa.csv.read_csv(io.BytesIO(header)).column_names
         as_text = pa.csv.read_csv(path, convert_options=pa.csv.ConvertOptions(
             column_types={n: pa.string() for n in names}))  # as-is：CSV 全列文本读入
         src = source or f"{path.parent.name}/{path.name}"
@@ -111,9 +115,10 @@ class Ingest:
         if not report.passed:
             raise BatchRejected(report)
         records = cleaned
-        cat = self.catalog.cat if hasattr(self.catalog, "cat") else self.catalog
+        cat = self.catalog  # DP-03.fix F4-①：旧 MemCatalog 适配死路（hasattr .cat）清除
         cat.begin_caller("dp2.ingest")  # 写面白名单声明（DP-W-D1-4）
-        batch_id = batch_id or f"b-{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        # 批次号缺省与 lake_store 同形 uuid（DP-03.fix F4-②：秒级时间戳同秒碰撞隐患清除）
+        batch_id = batch_id or f"b-{uuid.uuid4().hex[:12]}"
         snap = cat.append(table, records, commit_meta={
             "provenance": {"quality_report_id": provenance.quality_report_id,
                            "operator": provenance.operator},

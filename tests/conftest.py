@@ -3,7 +3,9 @@
 DP-03 后湖真身=LakeCatalog（PG raw schema＋MinIO，tests/dp1 实跑）；旧湖替身类已随
 「抛弃不修补」方针物理移除——编排层测试（dp2 三步契约／dp7 保留链）仍需要一个不依赖外部
 服务的 Catalog 替身承载 append/快照语义，本替身**只活在测试侧**（conftest），实现侧零替身。
-语义对齐真身：写面白名单／快照隔离／expire 只清时间旅行可见性／committed_at=真时钟。
+语义对齐真身：写面白名单／as-of 时点视图快照隔离（DP-03.fix F1：每业务键取最新批生效版，
+未登记业务键的表=纯时点累积；键口径共用 lake_store._BUSINESS_KEYS——替身/真身一致断言在
+tests/dp1 TestAsOfTimepointView）／expire 只清时间旅行可见性／committed_at=真时钟。
 """
 from __future__ import annotations
 
@@ -11,7 +13,8 @@ from datetime import datetime
 
 import pyarrow as pa
 
-from app.data_plane.lake_store import BoundaryViolation, SnapshotGoneError, SnapshotInfo
+from app.data_plane.lake_store import (BoundaryViolation, SnapshotGoneError, SnapshotInfo,
+                                       _BUSINESS_KEYS)
 
 _WRITE_ALLOWED = ("dp2.ingest", "dp3.transform")
 
@@ -73,7 +76,22 @@ class FakeSnapshotCatalog:
         state = self._tables[table]
         snaps = state["snaps"]
         current = snaps[max(snaps)]
-        merged = arrow if current.num_rows == 0 else pa.concat_tables([current, arrow])
+        rows = arrow.to_pylist()
+        key_cols = [c for c in _BUSINESS_KEYS.get(table, ()) if c in state["schema"].names]
+        if current.num_rows == 0:
+            merged = arrow
+        else:
+            if key_cols:
+                # as-of 对齐真身（DP-03.fix F1）：同键新批覆盖旧批（每键取最新批生效版，
+                # 不混用）；同批并列行全保留——A/B 班重复行是原始层合法内容
+                incoming = {tuple(r[k] for k in key_cols) for r in rows}
+                kept = pa.Table.from_pylist(
+                    [r for r in current.to_pylist()
+                     if tuple(r[k] for k in key_cols) not in incoming],
+                    schema=current.schema)
+            else:
+                kept = current
+            merged = pa.concat_tables([kept, arrow], promote_options="default")
         info = SnapshotInfo(snapshot_id=self._next,
                             committed_at=datetime.now().astimezone()
                             .replace(microsecond=0).isoformat(),

@@ -24,11 +24,12 @@ class Runner:
     """dp5 真链路替身：走 dp1 按快照 scan（不 mock SnapshotGoneError）。"""
     engine = "duckdb"
 
-    def __init__(self, catalog):
+    def __init__(self, catalog, table: str = "t"):
         self.catalog = catalog
+        self.table = table
 
     def run(self, query, snapshot_id=None, **kw):
-        arrow = self.catalog.load_table("t").scan(snapshot_id=snapshot_id).to_pylist()
+        arrow = self.catalog.load_table(self.table).scan(snapshot_id=snapshot_id).to_pylist()
         return type("R", (), {"arrow": arrow, "snapshot_id": snapshot_id})
 
 
@@ -70,3 +71,28 @@ def test_retention_real_chain(env):
     assert r4.match is True
     r5 = audit.replay(refs[4])
     assert r5.match is True
+
+
+def test_replay_asof_same_snapshot_stable():
+    """DP-03.fix F1 复验：同快照重放一致在 as-of 时点视图下成立——后续批同键改值
+    （D6 册坑一「按批次取最新，不混用」），新快照只见新版；按**记录快照**重放仍见当时
+    生效版，match=True（audit.py:115 replay 契约，快照语义修复不换契约）。"""
+    cat = FakeSnapshotCatalog()
+    cat.begin_caller("dp2.ingest")
+    cat.create_table("oil_production_daily",  # raw 8 表同名→命中业务键 well_id+prod_date
+                     schema=pa.Table.from_pylist(
+                         [{"well_id": "", "prod_date": "", "oil_output": 0.0}]).schema)
+    audit = Audit(store=InMemoryAudit(), runner=Runner(cat, "oil_production_daily"),
+                  clock=Clock())
+    s1 = cat.append("oil_production_daily", pa.Table.from_pylist(
+        [{"well_id": "N-01", "prod_date": "2025-09-01", "oil_output": 21.0}]), {})
+    original = cat.load_table("oil_production_daily") \
+        .scan(snapshot_id=s1.snapshot_id).to_pylist()  # 结论钉在 s1 时点视图
+    ref = audit.record("q-asof", q(), s1.snapshot_id, "0.1.0", "pass", original=original)
+
+    s2 = cat.append("oil_production_daily", pa.Table.from_pylist(
+        [{"well_id": "N-01", "prod_date": "2025-09-01", "oil_output": 25.0}]), {})  # 同键改值
+    t = cat.load_table("oil_production_daily")
+    assert t.scan(snapshot_id=s2.snapshot_id).to_pylist() == [
+        {"well_id": "N-01", "prod_date": "2025-09-01", "oil_output": 25.0}]  # 新版覆盖旧版
+    assert audit.replay(ref).match is True  # 重放按记录快照=旧时点，不被新批改写
