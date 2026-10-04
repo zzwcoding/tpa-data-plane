@@ -54,15 +54,21 @@ dp9 ← dp5, dp8
 目录: app/data_plane
 - 模块: `dp1`
 
-- **职责**：质量规则执行（20 条）、staging→intermediate→marts 分层、口径与血缘清单。
+- **职责**：质量规则执行（20 条）、staging→intermediate→出汇总层分层、口径与血缘清单。
 - **公开接口**：
   - `validate_batch(table: str, rules: list[QualityRule]) -> (QualityReport(passed, failures, rule_ids, report_id 🆕), cleaned_arrow 🆕)`（二元组裁决 #13）
+  - `validate_bundle(bundle, rules) -> list[QualityReport]`（20 条整队入口——DP-04 修 P4 全量入口崩）
   - `rule_mapping() -> dict[rule_id, test_name]`
-  - `build_marts() -> BuildResult(models_built, tests_passed, manifest_ref)`（S1=内置分层 SQL，dbt 形状留位）
-  - `lineage(model: str) -> LineageInfo(upstreams, downstreams, columns)`
+  - `build_agg(prod_rows, well_rows) -> {dim_well, dim_date, fct_daily_metering}`＋`AggStarWriter`（DP-04：agg 星型三表直写主平台库——99 册 §2.12 合同值，限写三表专用账号；v2 parquet marts 三模型已随 DP-04 退役删除）
 - **依赖**：dp1
 - **Seam/Adapter**：`Runner`；测试替身 `FakeDbt`（S1 不引入 dbt）
 - **测试计划**：DP-W-D3-1…4；20 条规则对象（1–12 原文 + 13–20 重建）；fieldforge 脏配方=挂样本源
+
+> **〔DP-04 注记（2026-10-04）〕** `build_marts`/`lineage`（parquet 物化面）已退役删除：模型名/粒度
+> 与 99 册不符（fct_block_monthly/fct_valid_output_monthly/fct_wellset_annual），改 agg 星型三表
+> （dim_well/dim_date/fct_daily_metering，grain=一井×一天）直写主平台库（ADR-0003 裁决 15）；血缘
+> 随进料 manifest（dp2 `_lineage_manifest`）与快照账承载。周期管道 worker（APScheduler——裁决 12）
+> 在 `worker/scheduler.py`（进料→清洗→质检→agg 刷新→水位登记）。
 
 ## dp4
 

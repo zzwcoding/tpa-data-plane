@@ -142,7 +142,7 @@ Python 3.12 · PyIceberg（湖表）· DuckDB（S1 引擎）· PyArrow（数据�
 | 11 | TimeWindow 未定义 | ✅ 定义 {start, end, granularity: day\|month\|intraday} |
 | 12 | formula_additive 未定义 | ✅ 15 指标逐条标注可加性（附录随 S2 落） |
 | 13 | clean_batch_arrow 未闭环 | ✅ validate_batch 返回 (report, cleaned_arrow) 二元组 |
-| 14 | marts 模型缺口 | ✅ S1 先落 3 张示范模型（fct_block_monthly/fct_valid_output_monthly/fct_wellset_annual 最小列集） |
+| 14 | marts 模型缺口 | ✅ S1 先落 3 张示范模型（fct_block_monthly/fct_valid_output_monthly/fct_wellset_annual 最小列集）〔DP-04 注记 2026-10-04：该三模型随 ADR-0003 裁决 15 重造退役——模型名/粒度与 teach 99 册 §2.12 不符；改 agg 星型三表 dim_well/dim_date/fct_daily_metering（grain=一井×一天）直写主平台库，parquet 物化路径删除〕 |
 | 15 | 映射表内容不全 | ✅ **最小补全**：fieldforge 种子已有 R3/BELT、N2/N-2 样本；数据面映射表 YAML 初版收录已知条目，补全另票 |
 | 16 | 三处水位两套账 | ✅ 唯一真源=dp2 FreshnessRegistry；m17 平台侧读它（真实化接线时对齐） |
 | 17 | UserContext 身份 | ✅ S1=静态 YAML 用户表（user/org/role），身份由调用方传入 |

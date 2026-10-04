@@ -125,8 +125,11 @@ class Ingest:
             "source": source,
             "batch_id": batch_id,
             "manifest": _lineage_manifest(table, batch_id, source, records.column_names)})
+        # P6 修复（DP-04，盘点 A 组点名 as_of 虚标）：登记 as_of 读**快照账 committed_at**
+        # （manifest 随行落账时刻＝数据真实生效时刻），不再取登记动作的墙钟 now()——
+        # 登记晚于提交时（重试/积压/重启追赶）不再把新鲜度虚标到登记瞬间。
         self._registry.register(table, tier="offline",
-                                as_of=_committed_as_of(), pipeline="batch-shift-report")
+                                as_of=_snapshot_as_of(snap), pipeline="batch-shift-report")
         return snap
 
     def register_freshness(self, table: str, tier: str, as_of: datetime, pipeline: str) -> None:
@@ -157,5 +160,10 @@ def _lineage_manifest(table: str, batch_id: str, source: str | None,
     }
 
 
-def _committed_as_of() -> datetime:
-    return datetime.now().replace(microsecond=0)
+def _snapshot_as_of(snap) -> datetime:
+    """快照账 committed_at → freshness as_of（P6：数据生效时刻，非登记墙钟；
+    快照无时刻时显式报错——宁缺不虚标）。"""
+    committed = getattr(snap, "committed_at", None)
+    if not committed:
+        raise ValueError(f"快照缺 committed_at，freshness 拒绝虚标（snapshot={snap!r}）")
+    return _as_dt(committed)

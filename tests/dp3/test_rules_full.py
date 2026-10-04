@@ -136,3 +136,67 @@ class TestRulesFull:
     def test_twenty_rules_registered(self):
         assert len(RULES_FULL) == 20
         assert len(rule_mapping()) == 20
+
+
+class TestFullSuiteEntry:
+    """DP-04 修 P4（全量入口崩，20261004 盘点 A 组点名三处）：整队入口 20 条一起跑。
+
+    1. rule-2 签名：批级版 `_r2_ratio` 注册在 check_batch 槽（收 bundle），原实现按
+       rows 用法消费 bundle → AttributeError（整队必崩）；
+    2. 孤儿井排序：井档案查无此人的行（block/well 缺失→None）进排序环节 None 与
+       str 比大小 → TypeError；
+    3. validate_bundle 此前零测试覆盖（98 测全绿但真能跑崩——1-2 课靶子实弹打出）。
+    """
+
+    @staticmethod
+    def _fixture_bundle():
+        import csv
+        from pathlib import Path
+        fx = Path(__file__).resolve().parents[1] / "fixtures" / "fieldforge"
+        return {f.stem: list(csv.DictReader(open(f, encoding="utf-8")))
+                for f in sorted(fx.glob("*.csv"))}
+
+    def test_validate_bundle_full_suite_on_fixture(self):
+        """整队入口对真数据：20 条规则各出一报告、零异常（P4-1/P4-3 闭合）。"""
+        from app.data_plane.transform import validate_bundle
+        reports = validate_bundle(self._fixture_bundle(), RULES_FULL)
+        assert len(reports) == 20
+        assert [r.rule_ids[0] for r in reports] == [r.rule_id for r in RULES_FULL]
+
+    def test_rule2_batch_threshold_semantics(self):
+        """rule-2 批级阈值：非空率 ≥99.5% 界内过、越界挂且定位空行（批级版签名修复后）。"""
+        near = bundle([prod_row(prod_date=f"2025-{m:02d}-{d:02d}")
+                       for m in range(1, 13) for d in range(1, 29)]  # 336 净行
+                      + [prod_row(prod_date="2025-12-31", oil_output=None)])
+        assert get("rule-2").check_batch(near) == []               # 1/337 ≈ 0.30% 界内
+        over = bundle([prod_row(prod_date=f"2025-09-{d:02d}") for d in range(1, 101)]
+                      + [prod_row(prod_date="2025-12-31", oil_output=None)])
+        assert len(get("rule-2").check_batch(over)) == 1           # 1/101 ≈ 0.99% > 0.5% 挂
+        empty_all = bundle([prod_row(oil_output=None), prod_row(oil_output=None, prod_date="2025-09-02")])
+        assert len(get("rule-2").check_batch(empty_all)) == 2      # 全空批=挂且定位两行
+
+    def test_orphan_well_rows_no_crash(self):
+        """孤儿井行（well_info 查无此人）：整队入口不再 TypeError——排序 None 安全。"""
+        from app.data_plane.transform import validate_bundle
+        b = self._fixture_bundle()
+        orphan = {"well_id": "ZZ-99", "prod_date": "2025-09-01", "oil_output": "1.0",
+                  "liquid_output": "2.0", "water_cut": "10.0", "open_days": "24.0",
+                  "oil_pressure": "5.0", "plan_output": "1.0", "report_shift": "A"}
+        b["oil_production_daily"] = b["oil_production_daily"] + [orphan]
+        reports = validate_bundle(b, RULES_FULL)  # P4-2 修复前：rule-10/12/15/18 排序崩
+        by_rule = {r.rule_ids[0]: r for r in reports}
+        assert len(by_rule["rule-13"].failures[0]) >= 2            # rule-13 挂孤儿行
+        # rule-12 不崩且如实挂账：孤儿井行 block=None 入账（修复前排序 TypeError）
+        assert any(f.get("block_name") is None
+                   for loc in by_rule["rule-12"].failures for f in loc[1:])
+
+    def test_rule12_orphan_block_sorts_none_safe(self):
+        """rule-12 裸函数直打：孤儿行 block=None 参与 sorted 不崩（P4 点名现场）——
+        孤儿井液量无对应注入＝物质平衡如实挂账（不再 TypeError 中断整队）。"""
+        b = bundle([prod_row(well_id="ZZ-99", liquid_output=1000.0)],
+                   well_info=[well(), well(well_id="I-01", well_type="IW", block_name="渤中")],
+                   water_injection_daily=[well(well_id="I-01", prod_date="2025-09-01",
+                                               inj_volume=1015.0)])
+        hits = get("rule-12").check_batch(b)   # 修复前：TypeError '<' NoneType vs str
+        assert {"block_name": None, "month": "2025-09", "dev": 1.0} in hits  # 孤儿井入账
+

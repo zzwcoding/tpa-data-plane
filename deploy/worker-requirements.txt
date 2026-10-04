@@ -1,0 +1,11 @@
+# tpa-data-plane 周期管道 worker 部署清单（DP-04，ADR-0003 裁决 12/15）。
+# 独立 worker 进程：python -m worker.scheduler（常驻周期）／--once（单周期干跑）。
+# 框架红线：APScheduler＝ADR-0003 裁决 12 点名框架（真引入）。
+# 装配环境变量：DATABASE_URL＋MINIO_ENDPOINT/MINIO_ACCESS_KEY/MINIO_SECRET_KEY（湖真身）、
+#   AGG_DATABASE_URL（agg 三表直写主平台库——限写三表专用账号，模板 migrations/agg_writer.sql；
+#   未配时 agg 步显式跳过）、DP_SCHED_TRIGGER/DP_SCHED_INTERVAL_MINUTES/DP_SCHED_CRON/
+#   DP_PIPELINE_RUN_DIR/DP_PIPELINE_TABLES（调度配置外置，见 worker/scheduler.py 模块头注）。
+APScheduler>=3.10,<4
+pyarrow>=14
+psycopg[binary]>=3.1
+boto3>=1.28

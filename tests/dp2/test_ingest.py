@@ -149,3 +149,32 @@ class TestFailClosedGate:
             ing.run_batch_load("oil_production_daily", dirty_batch(dup_at_end=False),
                                Provenance(quality_report_id="r0", operator="阿强"))
         assert not cat.committed
+
+
+class TestFreshnessAsOfFromSnapshot:
+    """DP-04 修 P6（as_of 虚标——盘点 A 组点名 ingest now()）：freshness 登记的 as_of
+    必须读**进料快照账的 committed_at**（manifest 随行落账时刻＝数据真实生效时刻），
+    不是登记动作的墙钟 now()——登记晚于提交时不再虚标新鲜度。"""
+
+    def test_as_of_equals_snapshot_committed_at(self):
+        from datetime import datetime as dt, timezone
+
+        fixed = dt(2026, 1, 1, 0, 0, 5, tzinfo=timezone.utc)
+
+        class FixedClockCatalog(FakeSnapshotCatalog):
+            def append(self, table, arrow, commit_meta):
+                snap = super().append(table, arrow, commit_meta)
+                from app.data_plane.lake_store import SnapshotInfo
+                return SnapshotInfo(snapshot_id=snap.snapshot_id,
+                                    committed_at=fixed.isoformat(), provenance=snap.provenance)
+
+        cat = FixedClockCatalog()
+        cat.create_table("oil_production_daily", schema=dirty_batch(1).schema)
+        ing = Ingest(catalog=cat, freshness=MemFreshness(),
+                     rules={"oil_production_daily": RULES_OIL_DAILY})
+        snap = ing.run_batch_load("oil_production_daily", dirty_batch(dup_at_end=False),
+                                  Provenance(quality_report_id="r6", operator="阿强"))
+        info = ing.freshness("oil_production_daily")
+        assert info.as_of == dt.fromisoformat(snap.committed_at) == fixed  # 快照账时刻
+        assert info.as_of != dt.now().replace(microsecond=0)               # 不再虚标墙钟
+
