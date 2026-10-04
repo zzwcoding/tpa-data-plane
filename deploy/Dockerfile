@@ -1,3 +1,6 @@
+# 【DEPRECATED · DP-02 退役标注（2026-10-04）】裁决 15 归位：问答面已退役，功能将由
+# 主平台问数链重建承接；本镜像与 serve 入口保留为参考标本，勿再演进
+# （serve/api.py 全部问答路由恒 410 Gone）。线上 8.163.33.135/dp/ 停服＝Owner 手工项。
 # tpa-data-plane API 镜像（构建上下文 = 本仓库根）
 FROM python:3.12-slim
 WORKDIR /app

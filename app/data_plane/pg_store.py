@@ -13,9 +13,8 @@ import os
 from dataclasses import asdict
 from datetime import date, datetime
 
-from app.data_plane.audit import AuditRecord
+from app.data_plane.audit import AuditRecord, StructuredQuery  # StructuredQuery 原 dp4 定义，裁决 15 归位后落位 audit.py（DP-02）
 from app.data_plane.freshness import FreshnessInfo
-from app.data_plane.semantic import StructuredQuery
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS freshness_registry (

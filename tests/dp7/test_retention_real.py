@@ -4,9 +4,8 @@ from __future__ import annotations
 import pyarrow as pa
 import pytest
 
-from app.data_plane.audit import Audit, InMemoryAudit, RetentionPolicy
+from app.data_plane.audit import Audit, InMemoryAudit, RetentionPolicy, StructuredQuery
 from app.data_plane.lake_store import InMemoryLake, SnapshotGoneError
-from app.data_plane.semantic import StructuredQuery
 
 
 def q():

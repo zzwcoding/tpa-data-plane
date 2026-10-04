@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from app.data_plane.governance import Governance, StaticPolicy, UserContext
-from app.data_plane.semantic import StructuredQuery
+from app.data_plane.audit import StructuredQuery  # 原 dp4 定义，裁决 15 归位后落位 audit.py（DP-02）
 
 POLICY = {
     "join_whitelist": [

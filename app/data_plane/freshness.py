@@ -1,5 +1,11 @@
 """dp6 新鲜度路由与拒答（S1 切片）：三查三出口 + 话术合同。
 
+【DP-02 归位标注（2026-10-04，ADR-0003 裁决 15）】语义归主平台问数链
+（17 链新鲜度闸链/行级权限链承载），本文件保留至问数链重建时移植思想、不搬代码（本票不删）。
+FreshnessRouter 的 semantic 注入 seam 保留（duck-typed：只消费 name/sql_table/granularity/
+additive），语义源由主平台问数链重建时承接；TimeWindow 原定义在 dp4 semantic.py（已随
+裁决 15 归位删除），现逐字内联落位于本文件。
+
 - 路由是确定性代码，无 LLM（DP6）；Seam=Clock（FakeClock 冻结测试）；
 - 拒答话术合同（DP-W-D6-2）：元素白名单=截至时点/未覆盖窗口/原因/改答路径；
   零编数纪律：未登记新鲜度的拒答连"数据截至"都不填；
@@ -11,7 +17,20 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from app.data_plane.semantic import TimeWindow  # noqa: F401  (dp6 依赖 dp4：粒度)
+
+@dataclass(frozen=True)
+class TimeWindow:
+    """裁决 #11：{start, end, granularity: day|month|intraday}。
+
+    原 dp4（semantic.py）定义，逐字保留；dp4 已随 ADR-0003 裁决 15 归位主平台（DP-02 删除），
+    dp6 路由合同仍以本形状消费时间窗，主平台问数链重建时以主平台自有 TimeWindow 为准。
+    """
+    start: str
+    end: str
+    granularity: str  # day | month | intraday
+
+    def get(self, key):
+        return getattr(self, key)
 
 
 @dataclass(frozen=True)

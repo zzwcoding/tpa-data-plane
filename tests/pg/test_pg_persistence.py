@@ -65,7 +65,7 @@ def test_freshness_newest_as_of_wins(clean_db):
 def test_audit_roundtrip_survives_restart_and_missing_ref(clean_db):
     from app.data_plane.audit import AuditRecord
     from app.data_plane.pg_store import PgAuditStore
-    from app.data_plane.semantic import StructuredQuery
+    from app.data_plane.audit import StructuredQuery  # 原 dp4 定义，裁决 15 归位后落位 audit.py（DP-02）
 
     q = StructuredQuery(
         metric="产量完成率", base_table="oil_production_daily",
@@ -96,7 +96,7 @@ def test_audit_roundtrip_survives_restart_and_missing_ref(clean_db):
 def test_audit_put_overwrites_same_question(clean_db):
     from app.data_plane.audit import AuditRecord
     from app.data_plane.pg_store import PgAuditStore
-    from app.data_plane.semantic import StructuredQuery
+    from app.data_plane.audit import StructuredQuery
 
     q = StructuredQuery(metric="商品量", base_table="monthly_settlement", tables=(),
                         measures=(), dims=(), time_dimensions=(), filters={})

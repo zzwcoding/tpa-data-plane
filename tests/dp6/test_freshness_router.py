@@ -1,10 +1,14 @@
-"""票 04 · dp6 路由拒答测试：三查三出口 / 话术合同零编数 / FakeClock。"""
+"""票 04 · dp6 路由拒答测试：三查三出口 / 话术合同零编数 / FakeClock。
+
+DP-02（裁决 15 归位）：dp4 语义层已删除，semantic 注入改用最小指标卡替身——
+只消费 dp6 实际读取的四字段（name/sql_table/granularity/additive），口径值逐字取自
+原 15 卡字典（产量完成率:16 additive=false；商品量:138、注采比:78 additive=true）。
+"""
 from __future__ import annotations
 
 from datetime import date, datetime
 
 from app.data_plane.freshness import FreshnessRouter, FreshnessInfo
-from app.data_plane.semantic import Semantic, StaticYaml
 
 TODAY = date(2026, 9, 27)
 
@@ -12,6 +16,32 @@ TODAY = date(2026, 9, 27)
 class FakeClock:
     def today(self) -> date:
         return TODAY
+
+
+class _Card:
+    """原 dp4 MetricDef 的 dp6 消费面替身。"""
+
+    def __init__(self, name: str, sql_table: str, granularity: str, additive: bool):
+        self.name, self.sql_table = name, sql_table
+        self.granularity, self.additive = granularity, additive
+
+
+class _StubSemantic:
+    """原 Semantic.metric_def 消费面替身（dp6 路由只经此一缝读语义）。"""
+
+    def __init__(self, cards: list[_Card]):
+        self._cards = {c.name: c for c in cards}
+
+    def metric_def(self, name: str):
+        return self._cards.get(name)
+
+
+def _dictionary() -> _StubSemantic:
+    return _StubSemantic([
+        _Card("产量完成率", "oil_production_daily", "月", False),
+        _Card("商品量", "monthly_settlement", "月", True),
+        _Card("注采比", "water_injection_daily", "月", True),
+    ])
 
 
 class StaticFreshness:
@@ -29,7 +59,7 @@ def make_router(registry_overrides: dict | None = None):
            "monthly_settlement": FreshnessInfo("offline", date(2026, 9, 26), "batch"),
            "rt_table": FreshnessInfo("realtime", datetime(2026, 9, 27, 10, 0), "flink")}
     reg.update(registry_overrides or {})
-    return FreshnessRouter(semantic=Semantic(StaticYaml.default()), freshness=StaticFreshness(reg),
+    return FreshnessRouter(semantic=_dictionary(), freshness=StaticFreshness(reg),
                            clock=FakeClock())
 
 

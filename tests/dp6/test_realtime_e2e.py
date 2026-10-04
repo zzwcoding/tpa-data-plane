@@ -11,11 +11,24 @@ from datetime import date, datetime
 from pathlib import Path
 
 from app.data_plane.freshness import FreshnessInfo, FreshnessRouter
-from app.data_plane.semantic import Semantic, StaticYaml
-
 
 
 SUB = Path(__file__).resolve().parents[1] / "fixtures" / "fieldforge" / "sensor_reading_subdaily.csv"
+
+
+class _Card:
+    """原 dp4 MetricDef 的 dp6 消费面替身（DP-02 裁决 15 归位后语义层已删）。"""
+
+    def __init__(self, name: str, sql_table: str, granularity: str, additive: bool):
+        self.name, self.sql_table = name, sql_table
+        self.granularity, self.additive = granularity, additive
+
+
+class _StubSemantic:
+    def metric_def(self, name: str):
+        if name == "商品量":  # 口径值逐字取自原 15 卡字典（:138 additive=true）
+            return _Card("商品量", "monthly_settlement", "月", True)
+        return None
 
 
 class Clock:
@@ -32,7 +45,7 @@ class Reg:
 
 
 def make_router(registry):
-    return FreshnessRouter(semantic=Semantic(StaticYaml.default()),
+    return FreshnessRouter(semantic=_StubSemantic(),
                            freshness=Reg(registry), clock=Clock())
 
 

@@ -1,7 +1,9 @@
-"""S2-02 · dp3 marts 三张示范模型测试：build_marts 物化 + lineage + dp4 对齐闸。
+"""S2-02 · dp3 marts 三张示范模型测试：build_marts 物化 + lineage。
 
 数据源：tests/fixtures/fieldforge 仓内合成最小集（DP-01 fixture 化，形状同 fieldforge
 合同产物；不再依赖 ~/Downloads/fieldforge 本机外部路径，CI hermetic）。
+DP-02（裁决 15 归位）：原 dp4 对齐闸三测（test_dp4_alignment_gate＋TestAlignGate）随
+dp4 语义层删除（对齐闸属 dp4，随语义职责归主平台；git 历史备查）。
 """
 from __future__ import annotations
 
@@ -55,43 +57,8 @@ class TestBuildMarts:
         ups = " ".join(ln.upstreams)
         assert "oil_production_daily" in ups and "well_info" in ups  # dbt 形状=source.petro.<表>
 
-    def test_dp4_alignment_gate(self, built):
-        """dp4 对齐闸：语义字典 sql_table 指向 marts 模型时，模型必须在 manifest。"""
-        from app.data_plane.semantic import Semantic, StaticYaml
-        sem = Semantic(StaticYaml.default())
-        result, _ = built
-        models = set(result.models_built)
-        # 字典中 marts 专属指标（裁决映射后）应可对齐；缺失模型=登记失败不放行
-        missing = [m.name for m in sem.metric_catalog()
-                   if m.sql_table.startswith("fct_") and m.sql_table not in models]
-        assert missing == []  # 当前字典指标都挂基表/marts 已建模型
-
     def test_manifest_ref_readable(self, built):
         import json
         result, out = built
         manifest = json.loads(Path(result.manifest_ref).read_text(encoding="utf-8"))
         assert "nodes" in manifest and "parent_map" in manifest
-
-
-class TestAlignGate:
-    def test_align_passes_with_built_marts(self, built):
-        """RF2-04：对齐闸落生产代码——有效产量 sql_table=fct_valid_output_monthly。"""
-        from app.data_plane.semantic import Semantic, StaticYaml
-        result, _ = built
-        manifest = json.loads(Path(result.manifest_ref).read_text(encoding="utf-8"))
-        sem = Semantic(StaticYaml.default())
-        m = {c.name: c for c in sem.metric_catalog()}
-        assert m["有效产量"].sql_table == "fct_valid_output_monthly"
-        assert sem.align_with_manifest(manifest) == []
-
-    def test_align_gate_rejects_missing_model(self, built):
-        """负样本：登记缺失模型 → 对齐闸返回缺失项（不放行）。"""
-        import json
-        from app.data_plane.semantic import Semantic, StaticYaml
-        result, _ = built
-        manifest = json.loads(Path(result.manifest_ref).read_text(encoding="utf-8"))
-        missing_manifest = {"nodes": {k: v for k, v in manifest["nodes"].items()
-                                      if k != "fct_valid_output_monthly"}}
-        sem = Semantic(StaticYaml.default())
-        missing = sem.align_with_manifest(missing_manifest)
-        assert any("fct_valid_output_monthly" in x for x in missing)
