@@ -53,17 +53,17 @@ class TestBatchIngest:
             ing.run_batch_load("oil_production_daily", dirty_batch(),
                                Provenance(quality_report_id="r0", operator="阿强"))
         assert not cat.committed  # 脏批未入湖
-        assert ei.value.report.report_id  # 质检报告随拒绝携带
+        assert ei.value.report.rule_ids  # 闸裁决随拒绝携带（DP-05：GateVerdict）
 
     def test_clean_batch_appends_with_provenance_and_freshness(self, ingest):
         """DP-W-D2-1 后半 + D2-3：净批入湖带 provenance；freshness=offline 可读。"""
         ing, cat = ingest
         table = dirty_batch(dup_at_end=False)  # 净批（无重复行）
-        report, cleaned = validate_batch(table, RULES_OIL_DAILY)
-        assert report.passed
+        verdict, cleaned = validate_batch(table, RULES_OIL_DAILY)
+        assert verdict.passed
         snap = ing.run_batch_load("oil_production_daily", cleaned,
-                                  Provenance(quality_report_id=report.report_id, operator="阿强"))
-        assert cat.committed[0]["provenance"]["quality_report_id"] == report.report_id
+                                  Provenance(quality_report_id="QT-20260928-01", operator="阿强"))
+        assert cat.committed[0]["provenance"]["quality_report_id"] == "QT-20260928-01"
         info = ing.freshness("oil_production_daily")
         assert info.tier == "offline" and info.pipeline == "batch-shift-report"
 

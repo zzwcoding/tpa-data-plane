@@ -145,7 +145,8 @@ class TestFullSuiteEntry:
        rows 用法消费 bundle → AttributeError（整队必崩）；
     2. 孤儿井排序：井档案查无此人的行（block/well 缺失→None）进排序环节 None 与
        str 比大小 → TypeError；
-    3. validate_bundle 此前零测试覆盖（98 测全绿但真能跑崩——1-2 课靶子实弹打出）。
+    3. 整队入口此前零测试覆盖（98 测全绿但真能跑崩——1-2 课靶子实弹打出；
+       DP-05 起整队入口＝evaluate_bundle 纯计算＋quality_store.run_quality_task 落库）。
     """
 
     @staticmethod
@@ -156,12 +157,13 @@ class TestFullSuiteEntry:
         return {f.stem: list(csv.DictReader(open(f, encoding="utf-8")))
                 for f in sorted(fx.glob("*.csv"))}
 
-    def test_validate_bundle_full_suite_on_fixture(self):
-        """整队入口对真数据：20 条规则各出一报告、零异常（P4-1/P4-3 闭合）。"""
-        from app.data_plane.transform import validate_bundle
-        reports = validate_bundle(self._fixture_bundle(), RULES_FULL)
-        assert len(reports) == 20
-        assert [r.rule_ids[0] for r in reports] == [r.rule_id for r in RULES_FULL]
+    def test_evaluate_bundle_full_suite_on_fixture(self):
+        """整队入口对真数据：20 条规则各出一裁决、零异常（P4-1/P4-3 闭合；
+        DP-05：validate_bundle 内存报告路径清零——落库编排见 tests/pg/test_quality_store.py）。"""
+        from app.data_plane.transform import evaluate_bundle
+        outcomes = evaluate_bundle(self._fixture_bundle(), RULES_FULL)
+        assert len(outcomes) == 20
+        assert [o.rule_id for o in outcomes] == [r.rule_id for r in RULES_FULL]
 
     def test_rule2_batch_threshold_semantics(self):
         """rule-2 批级阈值：非空率 ≥99.5% 界内过、越界挂且定位空行（批级版签名修复后）。"""
@@ -177,18 +179,18 @@ class TestFullSuiteEntry:
 
     def test_orphan_well_rows_no_crash(self):
         """孤儿井行（well_info 查无此人）：整队入口不再 TypeError——排序 None 安全。"""
-        from app.data_plane.transform import validate_bundle
+        from app.data_plane.transform import evaluate_bundle
         b = self._fixture_bundle()
         orphan = {"well_id": "ZZ-99", "prod_date": "2025-09-01", "oil_output": "1.0",
                   "liquid_output": "2.0", "water_cut": "10.0", "open_days": "24.0",
                   "oil_pressure": "5.0", "plan_output": "1.0", "report_shift": "A"}
         b["oil_production_daily"] = b["oil_production_daily"] + [orphan]
-        reports = validate_bundle(b, RULES_FULL)  # P4-2 修复前：rule-10/12/15/18 排序崩
-        by_rule = {r.rule_ids[0]: r for r in reports}
-        assert len(by_rule["rule-13"].failures[0]) >= 2            # rule-13 挂孤儿行
+        outcomes = evaluate_bundle(b, RULES_FULL)  # P4-2 修复前：rule-10/12/15/18 排序崩
+        by_rule = {o.rule_id: o for o in outcomes}
+        assert {"well_id": "ZZ-99", "prod_date": "2025-09-01"} \
+            in by_rule["rule-13"].locators                            # rule-13 挂孤儿行
         # rule-12 不崩且如实挂账：孤儿井行 block=None 入账（修复前排序 TypeError）
-        assert any(f.get("block_name") is None
-                   for loc in by_rule["rule-12"].failures for f in loc[1:])
+        assert any(f.get("block_name") is None for f in by_rule["rule-12"].locators)
 
     def test_rule12_orphan_block_sorts_none_safe(self):
         """rule-12 裸函数直打：孤儿行 block=None 参与 sorted 不崩（P4 点名现场）——

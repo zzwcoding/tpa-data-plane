@@ -1,10 +1,11 @@
-"""票 01 · dp3 质量闸测试（TDD）：规则 1/2/3/5 + cleaned_arrow + report_id。"""
+"""票 01 · dp3 质量闸测试（TDD）：规则 1/2/3/5 + cleaned_arrow + 闸裁决。"""
 from __future__ import annotations
 
 import pyarrow as pa
 import pytest
 
-from app.data_plane.transform import RULE_1, RULE_2, RULE_3, RULE_5, validate_batch, rule_mapping
+from app.data_plane.transform import (RULE_1, RULE_2, RULE_3, RULE_5, GateVerdict,
+                                      validate_batch, rule_mapping)
 
 
 def make_table(rows: list[dict]) -> pa.Table:
@@ -59,11 +60,13 @@ class TestValidateBatch:
         assert cleaned.column_names == table.column_names
         assert cleaned.schema.field("oil_output").type == table.schema.field("oil_output").type
 
-    def test_report_id_present_and_unique(self):
+    def test_verdict_shape_and_rule_ids(self):
+        """DP-05：闸裁决＝GateVerdict（passed/failures/rule_ids）——内存弃置报告清零，
+        报告身份归 quality_task.id（落库真身见 tests/pg/test_quality_store.py）。"""
         t = make_table([base_row()])
-        r1, _ = validate_batch(t, RULES)
-        r2, _ = validate_batch(t, RULES)
-        assert r1.report_id and r2.report_id and r1.report_id != r2.report_id
+        v, _ = validate_batch(t, RULES)
+        assert isinstance(v, GateVerdict)
+        assert v.passed and v.rule_ids == [r.rule_id for r in RULES]
 
     def test_rule_mapping(self):
         m = rule_mapping()

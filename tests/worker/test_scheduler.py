@@ -52,19 +52,52 @@ def catalog():
     return cat
 
 
-def cfg(catalog, run_dir, writer=None):
-    return PipelineConfig(run_dir=run_dir, agg_writer=writer,
+def cfg(catalog, run_dir, writer=None, quality_store=None):
+    return PipelineConfig(run_dir=run_dir, agg_writer=writer, quality_store=quality_store,
                           freshness=InMemoryFreshnessRegistry())
+
+
+class FakeQualityStore:
+    """QualityStore 测试替身（DP-05）：记账质检落库与报水位调用（duck-typed 同形）。
+
+    启用集语义照 seed（1-12 启用、2 号隔离档必挂 fixture 空油量行……由 run_quality_task
+    真编排消费——替身只承载 PG 面，编排纯逻辑另有 tests/dp3/test_quality_run.py 直测）。"""
+
+    def __init__(self):
+        self.quarantine: list[dict] = []
+        self.water: list[tuple] = []
+        self.finished: list[dict] = []
+        self._n = 0
+
+    def enabled_rules(self):
+        return [{"no": n, "kind": "k", "rule": "r", "crit": "c",
+                 "action": "隔离" if n == 2 else "告警", "autofix": False}
+                for n in range(1, 13)]
+
+    def create_task(self, rules_count, *, now=None):
+        self._n += 1
+        return f"QT-20260928-{self._n:02d}"
+
+    def finish_task(self, task_id, *, hits, report, step=2):
+        self.finished.append({"id": task_id, "hits": hits, "report": report})
+
+    def append_quarantine(self, rows):
+        self.quarantine.extend(rows)
+        return len(rows)
+
+    def raise_water_line(self, layer, data_date):
+        self.water.append((layer, str(data_date)))
+        return data_date is not None
 
 
 class TestRunPipelineOnce:
     def test_full_cycle_ingest_quality_agg_freshness(self, catalog, run_dir):
-        """一周期：日度进料（拉新批次）→清洗→质检→agg 刷新→水位登记（freshness 更新）。"""
+        """一周期：日度进料（拉新批次）→清洗→质检跑批→agg 刷新→水位登记（freshness 更新）。"""
         writer = FakeWriter()
         summary = run_pipeline_once(cfg(catalog, run_dir, writer),
                                     catalog_factory=lambda: catalog)
         assert set(summary["ingested"]) == set(TABLES)
-        assert summary["quality"]["rules_total"] == 20            # 整队质检（P4 修后入口）
+        assert summary["quality"].startswith("skipped")       # 未配 QUALITY_DATABASE_URL＝显式跳过
         assert writer.calls and set(writer.calls[0]) == {
             "dim_well", "dim_date", "fct_daily_metering"}         # agg 直写恰三表
         fct = writer.calls[0]["fct_daily_metering"]
@@ -76,6 +109,27 @@ class TestRunPipelineOnce:
         assert reg.freshness("agg.fct_daily_metering").pipeline == "dp3-agg-refresh"
         # 进料侧水位：as_of=快照账 committed_at（P6 修复随管道生效）
         assert reg.freshness("oil_production_daily").as_of is not None
+
+    def test_quality_store_wiring_task_waterline(self, catalog, run_dir):
+        """DP-05 接线：质检跑批落库（QT 任务号随 provenance 入湖）＋报水位三 tier
+        （原始/清洗层=进料水位、汇总层=agg 刷新水位——E2 行为约定 8）。"""
+        store = FakeQualityStore()
+        writer = FakeWriter()
+        summary = run_pipeline_once(cfg(catalog, run_dir, writer, store),
+                                    catalog_factory=lambda: catalog)
+        task_id = summary["quality"]["task_id"]
+        assert task_id.startswith("QT-")
+        assert len(store.finished) == 1 and store.finished[0]["id"] == task_id
+        assert store.finished[0]["report"]["quarantined_rows"] \
+            == summary["quality"]["quarantined_rows"]
+        # 报水位：原始/清洗层（进料批业务日期）＋汇总层（agg fct 最大业务日期）
+        assert [w[0] for w in store.water] == ["原始层", "清洗层", "原始层", "清洗层", "汇总层"]
+        assert store.water[-1][1] == max(r["prod_date"] for r in writer.calls[0]["fct_daily_metering"])
+
+    def test_quality_skipped_without_store_records_honestly(self, catalog, run_dir):
+        summary = run_pipeline_once(cfg(catalog, run_dir, FakeWriter(), None),
+                                    catalog_factory=lambda: catalog)
+        assert summary["quality"].startswith("skipped（未配 QUALITY_DATABASE_URL")
 
     def test_agg_skipped_without_writer(self, catalog, run_dir):
         """未配 AGG_DATABASE_URL：agg 步显式跳过（摘要记 skipped，不静默装成功）。"""

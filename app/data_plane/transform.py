@@ -2,9 +2,12 @@
 
 - QualityRule：判据=rows(list[dict]) 上的纯函数，返回违例定位器列表；
 - validate_batch：先质检（不合格行从 cleaned 中剔除——clean_batch_arrow 闭环，裁决 #13），
-  返回 (QualityReport, cleaned_arrow)；QualityReport 带 report_id（裁决 #9）；
-- validate_bundle：S2 全量形态（20 条一起跑的整队入口）——P4（全量入口崩）随 DP-04 修复
-  并补整队测试（20261004 盘点 A 组点名：rule-2 签名/孤儿井排序/未测三处）；
+  返回 (GateVerdict, cleaned_arrow)；闸裁决强制执行（拒批即 BatchRejected 载体，非弃置件）；
+- evaluate_bundle：S2 全量形态（20 条一起跑的整队入口）纯计算——P4（全量入口崩）随 DP-04 修复
+  并补整队测试（20261004 盘点 A 组点名：rule-2 签名/孤儿井排序/未测三处）；整队跑批**落库**
+  编排＝quality_store.run_quality_task（DP-05：质检跑批结果落主平台库 quality_task/
+  quarantine_row——原 validate_bundle 内存 QualityReport 弃置路径随之清零，报告身份＝
+  quality_task.id 同源物理落点＝同表）；
 - rule_mapping：规则 ID ↔ 测试名对照（DP-W-D3-1/2）。
 - 出汇总层（marts）已随 DP-04 重造：v2 parquet 物化三模型（fct_block_monthly/
   fct_valid_output_monthly/fct_wellset_annual——模型名/粒度与 99 册不符）退役删除，
@@ -14,9 +17,8 @@
 """
 from __future__ import annotations
 
-import uuid
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pyarrow as pa
 
@@ -34,11 +36,23 @@ class QualityRule:
 
 
 @dataclass(frozen=True)
-class QualityReport:
+class GateVerdict:
+    """进料闸裁决（闸强制执行——拒批即 BatchRejected 载体，非弃置件）。
+
+    DP-05 起 dp3 无内存弃置报告：质检跑批结果落主平台库 quality_task/quarantine_row
+    （quality_store.run_quality_task——报告身份＝quality_task.id，与 E2 同源同表）。"""
     passed: bool
-    failures: list
+    failures: list      # [(rule_id, *定位器样本≤5)]——闸拒绝留痕用
     rule_ids: list[str]
-    report_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+
+
+@dataclass(frozen=True)
+class RuleOutcome:
+    """整队质检单规则裁决（evaluate_bundle 纯计算输出；落库编排消费全量定位器）。"""
+    rule_id: str
+    passed: bool
+    locators: list      # 全量失败定位器（报告样本截断在编排侧做）
+    hit_count: int
 
 
 def _num(row: dict, col: str) -> float | None:
@@ -130,8 +144,8 @@ def rule_mapping() -> dict[str, str]:
     return {r.rule_id: "check_" + r.rule_id for r in RULES_FULL}
 
 
-def validate_batch(table: pa.Table, rules: list[QualityRule]) -> tuple[QualityReport, pa.Table]:
-    """质检闸：返回 (QualityReport, cleaned_arrow)。不合格行从 cleaned 剔除（保留首条）。"""
+def validate_batch(table: pa.Table, rules: list[QualityRule]) -> tuple[GateVerdict, pa.Table]:
+    """质检闸：返回 (GateVerdict, cleaned_arrow)。不合格行从 cleaned 剔除（保留首条）。"""
     rows = table.to_pylist()
     failures: list = []
     rule_ids: list[str] = []
@@ -149,10 +163,10 @@ def validate_batch(table: pa.Table, rules: list[QualityRule]) -> tuple[QualityRe
                     elif "well_id" in loc and \
                             (loc.get("well_id"), loc.get("prod_date")) == (r.get("well_id"), r.get("prod_date")):
                         bad_index.add(i)
-    report = QualityReport(passed=not failures, failures=failures, rule_ids=rule_ids)
+    verdict = GateVerdict(passed=not failures, failures=failures, rule_ids=rule_ids)
     clean_rows = [r for i, r in enumerate(rows) if i not in bad_index]
     cleaned = pa.Table.from_pylist(clean_rows, schema=table.schema)
-    return report, cleaned
+    return verdict, cleaned
 
 
 # ============================================================ S2-01 · 规则全量
@@ -446,11 +460,15 @@ RULES_FULL = [
 
 
 
-def validate_bundle(bundle: dict, rules: list[QualityRule]) -> list[QualityReport]:
-    """S2 bundle 形态质检：逐规则出独立报告（失败定位到表+定位器）。"""
-    reports = []
+def evaluate_bundle(bundle: dict, rules: list[QualityRule]) -> list[RuleOutcome]:
+    """S2 整队质检纯计算：逐规则出 RuleOutcome（全量定位器＋命中数）。
+
+    DP-05 起整队跑批落库由 quality_store.run_quality_task 承接（读启用集→建任务→
+    隔离区落行→报告 1:1 完任务）——本函数只算不落，原 validate_bundle 的内存
+    QualityReport 弃置路径随之清零（DP-05 验收 2）。"""
+    outcomes = []
     for rule in rules:
         locators = rule.check_batch(bundle)
-        reports.append(QualityReport(passed=not locators, failures=[(rule.rule_id, *locators[:5])],
-                                     rule_ids=[rule.rule_id]))
-    return reports
+        outcomes.append(RuleOutcome(rule_id=rule.rule_id, passed=not locators,
+                                    locators=locators, hit_count=len(locators)))
+    return outcomes

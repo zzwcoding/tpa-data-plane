@@ -175,11 +175,14 @@ class AggStarWriter:
         return psycopg.connect(self._dsn)
 
 
-def refresh_from_catalog(catalog, writer, freshness=None, pipeline: str = "dp3-agg-refresh"):
+def refresh_from_catalog(catalog, writer, freshness=None, water_line=None,
+                         pipeline: str = "dp3-agg-refresh"):
     """出汇总层编排：湖 as-of 当前视图（清洗语义＝闸后净批＋每键最新批）→ 星型构建 → 直写。
 
     返回 {表名: 行数} 摘要；freshness seam 在位则登记汇总层三表（offline 档——
-    三 tier 模型的批域档位，as_of=刷新完成时刻）。"""
+    三 tier 模型的批域档位，as_of=刷新完成时刻）；water_line seam 在位则回写汇总层
+    报水位（E2 行为约定 8：汇总层＝agg 刷新水位——data_date=fct 最大业务日期，
+    promise=T-1 判定归 E2 端点 8 服务端算）。"""
     prod = catalog.load_table("oil_production_daily").scan().to_pylist()
     wells = catalog.load_table("well_info").scan().to_pylist()
     agg_rows = build_agg(prod, wells)
@@ -190,4 +193,7 @@ def refresh_from_catalog(catalog, writer, freshness=None, pipeline: str = "dp3-a
         as_of = datetime.now().replace(microsecond=0)
         for t in ("agg.dim_well", "agg.dim_date", "agg.fct_daily_metering"):
             freshness.register(t, tier="offline", as_of=as_of, pipeline=pipeline)
+    if water_line is not None:
+        days = [r["prod_date"] for r in agg_rows["fct_daily_metering"] if r["prod_date"]]
+        water_line.raise_water_line("汇总层", max(days))
     return counts
