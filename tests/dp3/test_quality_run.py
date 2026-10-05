@@ -100,7 +100,8 @@ class TestRunQualityTask:
             <= fin["report"]["hits"][0].items()
 
     def test_hits_dedupe_issue_granularity(self):
-        """单据粒度 hits＝（规则＋对象＋数据日期）去重——同对象多定位器不翻倍。"""
+        """单据粒度 hits＝（规则＋对象＋数据日期）去重——同对象多定位器不翻倍；
+        隔离行数据粒度按寻址键去重（F-04/DP-07：同批完全同值 twin 行只计一）。"""
         store = FakeStore(_specs(2))
         bundle = _dirty_bundle()
         rows = bundle["oil_production_daily"]
@@ -109,7 +110,7 @@ class TestRunQualityTask:
         bundle["oil_production_daily"] = rows + [bad, dict(bad)]
         summary = run_quality_task(store, bundle)
         assert summary["hits"] == 2          # 两个（规则2＋对象＋数据日期）组合
-        assert len(store.quarantine) == 3    # 隔离行按坏行落（数据粒度≠单据粒度）
+        assert len(store.quarantine) == 2    # bad 与其完全同值 twin 寻址键同→1＋另一单 1（F-04）
 
     def test_no_findings_clean_task(self):
         store = FakeStore(_specs(5))

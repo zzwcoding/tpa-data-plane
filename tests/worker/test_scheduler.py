@@ -10,7 +10,7 @@ import pytest
 
 apscheduler = pytest.importorskip("apscheduler")
 
-from app.data_plane.ingest import InMemoryFreshnessRegistry
+from app.data_plane.ingest import InMemoryFreshnessRegistry, Ingest
 from app.data_plane.transform import RULES_OIL_DAILY, RULES_WELL_INFO
 from tests.conftest import FakeSnapshotCatalog
 from worker.scheduler import (PipelineConfig, build_scheduler, build_trigger,
@@ -180,3 +180,125 @@ class TestScheduleConfig:
                                 catalog_factory=lambda: catalog)
         assert len(sched.get_jobs()) == 1
         assert sched.get_jobs()[0].id == "dp-pipeline"
+
+
+# ---------- DP-07 F-01：扫描面解耦 -----------------------------------------------
+
+
+class TestScanSurfaceDecoupled:
+    """F-01（DP-07 全量审查 R-DP F-01）：管道质检的扫描面与进料面解耦——
+    扫描面缺省＝全部受检 8 表（DP_SCAN_TABLES），进料面保持 DP_PIPELINE_TABLES
+    agg 两源原语义；扩进料表清单不再 UnruledTableRejected 崩周期。"""
+
+    @pytest.fixture()
+    def run_dir8(self, tmp_path):
+        """全 8 受检表 run 目录：fixture 拷贝＋water_injection_daily 合成＋定向坏行注入
+        （rule-6 检修批 -T3／rule-8 停机码 X9／rule-11 传感 8 连零／rule-12/15 注水失衡
+        ／rule-19 月结算钩稽失配）。"""
+        d = tmp_path / "run-full8"
+        d.mkdir()
+        for f in FIXTURES.glob("*.csv"):
+            shutil.copy(f, d / f.name)
+        d.joinpath("water_injection_daily.csv").write_text(
+            "well_id,prod_date,inj_volume\n"
+            "N-01,2025-09-06,100\n"
+            "N-01,2025-09-07,99999\n", encoding="utf-8")
+        d.joinpath("equip_status.csv").write_text(
+            FIXTURES.joinpath("equip_status.csv").read_text(encoding="utf-8")
+            + "EQ-Z-09,螺杆泵,60.0,24.0,X9\n", encoding="utf-8")
+        d.joinpath("well_overhaul.csv").write_text(
+            FIXTURES.joinpath("well_overhaul.csv").read_text(encoding="utf-8")
+            + "N-09,2026-05-10,2026-05-12,检泵,10.0,20260510-T3\n", encoding="utf-8")
+        d.joinpath("monthly_settlement.csv").write_text(
+            FIXTURES.joinpath("monthly_settlement.csv").read_text(encoding="utf-8")
+            + "渤中,2025-09-30,0.01\n", encoding="utf-8")
+        zeros = "".join(f"N-01,N-01-TEMP,2025-09-02T0{i}:00:00,0.0\n" for i in range(8))
+        d.joinpath("sensor_reading_subdaily.csv").write_text(
+            FIXTURES.joinpath("sensor_reading_subdaily.csv").read_text(encoding="utf-8")
+            + zeros, encoding="utf-8")
+        return d
+
+    def test_pipeline_quality_scans_all_checked_tables(self, catalog, run_dir8):
+        """管道质检扫描面＝全 8 受检表：报告 tables 八键、range「生产库 8 表」、
+        规则 6/8/11/12 真跑（fixture＋定向坏行，非结构性空跑恒绿）。"""
+        store = FakeQualityStore()
+        writer = FakeWriter()
+        summary = run_pipeline_once(cfg(catalog, run_dir8, writer, store),
+                                    catalog_factory=lambda: catalog)
+        report = store.finished[0]["report"]
+        assert set(report["tables"]) == {
+            "oil_production_daily", "well_info", "well_overhaul", "equip_status",
+            "sensor_reading_subdaily", "water_injection_daily", "monthly_settlement",
+            "fluid_test"}
+        assert report["range"] == "生产库 8 表"                    # 实扫表数动态生成
+        assert {h["rule_no"] for h in report["hits"]} >= {6, 8, 11, 12}
+        assert set(summary["ingested"]) == {"oil_production_daily", "well_info"}  # 进料面原语义
+
+    def test_expanded_pipeline_tables_do_not_crash_cycle(self, catalog, run_dir8):
+        """扩进料表清单（纳入无进料规则集的表）不再崩周期：UnruledTableRejected 诚实
+        跳过记摘要，闸 fail-closed 语义不变（表不入湖），其余表照常进料、agg 照常刷新。"""
+        writer = FakeWriter()
+        cfgx = PipelineConfig(run_dir=run_dir8, freshness=InMemoryFreshnessRegistry(),
+                              agg_writer=writer, quality_store=None,
+                              tables=("oil_production_daily", "well_info", "equip_status"))
+        summary = run_pipeline_once(cfgx, catalog_factory=lambda: catalog)
+        assert set(summary["ingested"]) == {"oil_production_daily", "well_info"}
+        assert summary["unruled_skipped"] == ["equip_status"]      # 诚实跳过不崩
+        assert writer.calls                                        # 周期照常走完（agg 发生）
+
+
+class TestScanTablesConfig:
+    def test_scan_tables_env_default_and_override(self, monkeypatch):
+        """扫描面独立环境变量 DP_SCAN_TABLES（缺省 8 受检表）；进料面 DP_PIPELINE_TABLES
+        原语义不动（缺省 agg 两源）——两面貌合变量解耦。"""
+        from worker.scheduler import _SCAN_TABLES
+        monkeypatch.delenv("DP_SCAN_TABLES", raising=False)
+        loaded = load_config()
+        assert loaded.scan_tables == _SCAN_TABLES
+        assert set(loaded.scan_tables) >= set(loaded.tables)       # 缺省进料面 ⊆ 扫描面
+        monkeypatch.setenv("DP_SCAN_TABLES", "oil_production_daily,equip_status")
+        assert load_config().scan_tables == ("oil_production_daily", "equip_status")
+        assert load_config().tables == ("oil_production_daily", "well_info")  # 进料面不受染
+
+
+# ---------- DP-07 F-03：报水位取闸后净批 -----------------------------------------
+
+
+class TestWaterLineNetBatch:
+    def test_water_line_follows_landed_net_batch(self, catalog, run_dir, monkeypatch):
+        """F-03（DP-07）：原始/清洗层水位取**闸后净批**（质检通过后落位批）——
+        最新业务日期行被闸剔除（脏）时水位不得虚标到被剔日期（单调不回退会把虚标
+        锁死）。以闸后净批裁剪模拟清洗语义（S1 设计：cleaned 剔除坏行），原始 CSV
+        行仍见被剔日期——水位必须跟落位批走。"""
+        src = FIXTURES.joinpath("oil_production_daily.csv").read_text(encoding="utf-8")
+        run_dir.joinpath("oil_production_daily.csv").write_text(
+            src + "N-01,2025-12-31,99.0,120.0,10.0,24.0,24.0,7.5,A\n", encoding="utf-8")
+        real_load = Ingest._load
+
+        def net_load(self_ing, table, records, provenance, *, source=None, batch_id=None):
+            rows = [r for r in records.to_pylist() if r.get("prod_date") != "2025-12-31"]
+            return real_load(self_ing, table,
+                             pa.Table.from_pylist(rows, schema=records.schema),
+                             provenance, source=source, batch_id=batch_id)
+
+        monkeypatch.setattr(Ingest, "_load", net_load)
+        store = FakeQualityStore()
+        run_pipeline_once(cfg(catalog, run_dir, FakeWriter(), store),
+                          catalog_factory=lambda: catalog)
+        raw_days = [d for layer, d in store.water if layer == "原始层"]
+        assert "2025-09-07" in raw_days                            # 落位净批日期在水位
+        assert "2025-12-31" not in raw_days                        # 被剔日期不虚标（F-03）
+
+    def test_rejected_batch_writes_no_water_claim(self, catalog, tmp_path):
+        """F-03 另一半：脏批（进料闸拒）不入水位——落位不发生即无水位主张。"""
+        d = tmp_path / "run-dirty"
+        d.mkdir()
+        shutil.copy(FIXTURES / "well_info.csv", d / "well_info.csv")
+        rows = FIXTURES.joinpath("oil_production_daily.csv").read_text(
+            encoding="utf-8").splitlines()
+        d.joinpath("oil_production_daily.csv").write_text(
+            "\n".join(rows[:3] + [rows[2].replace(",A", ",B")]) + "\n", encoding="utf-8")
+        store = FakeQualityStore()
+        run_pipeline_once(cfg(catalog, d, FakeWriter(), store),
+                          catalog_factory=lambda: catalog)
+        assert [w for w in store.water if w[1] != "None"] == []    # 无任何有日期的水位主张

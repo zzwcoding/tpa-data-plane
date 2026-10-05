@@ -13,10 +13,12 @@
 from __future__ import annotations
 
 import csv
+import io
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import pyarrow as pa
+import pyarrow.csv  # noqa: F401  (pyarrow 命名空间懒加载：pa.csv.* 需显式导入)
 import pytest
 
 apscheduler = pytest.importorskip("apscheduler")
@@ -39,10 +41,12 @@ class FakePickupStore:
     hits/report/time）×拾取四操作（pending/claim/heal/finish）的内存同构镜像——
     真 DDL 语义（条件 UPDATE 认领闸/RETURNING 自愈）由 tests/pg 复证。"""
 
-    def __init__(self, *, fail_on: tuple = ()):
+    def __init__(self, *, fail_on: tuple = (), enabled_nos: tuple | None = None):
         self.rows: dict[str, dict] = {}
         self.quarantine: list[dict] = []
         self._fail_on = set(fail_on)
+        # 启用集可注入（F-01 扫描面测试需含 13-20 段的 15/19；缺省照种子 1-12）
+        self._enabled = tuple(enabled_nos) if enabled_nos is not None else tuple(range(1, 13))
 
     def add_task(self, task_id: str, *, status: str = "running", step: int = 0,
                  rules_count: int | None = None, time: datetime | None = None) -> str:
@@ -55,8 +59,8 @@ class FakePickupStore:
 
     def enabled_rules(self) -> list[dict]:
         return [{"no": n, "kind": "k", "rule": "r", "crit": "c",
-                 "action": "隔离" if n == 2 else "告警", "autofix": False}
-                for n in range(1, 13)]
+                 "action": "隔离" if n in (2, 8) else "告警", "autofix": False}
+                for n in self._enabled]
 
     def pending_tasks(self) -> list[str]:
         return sorted((r["id"] for r in self.rows.values()
@@ -123,6 +127,49 @@ def cfg(store, *, stale_seconds: int = 3600, catalog_factory=None) -> PipelineCo
 
 
 HOUR_AGO = datetime.now().replace(microsecond=0) - timedelta(hours=1)
+
+# F-01 扫描面（DP-07）：拾取/质检受检表全集＝001 八张 as-is 源表（99 册 §2.0）
+SCAN_TABLES_EIGHT = ("oil_production_daily", "well_info", "well_overhaul", "equip_status",
+                     "sensor_reading_subdaily", "water_injection_daily",
+                     "monthly_settlement", "fluid_test")
+
+
+def _lake_with_scan_surface() -> FakeSnapshotCatalog:
+    """八表全量湖（fixture 数据＋六条规则定向坏行注入）——F-01「规则在扫描面真跑」载体：
+    rule-6 检修批 -T3／rule-8 未知停机码 X9／rule-11 传感 8 连零／rule-12 注入失衡／
+    rule-15 注水骤变／rule-19 月结算钩稽失配。全列文本（与进料 as-is 口径一致）。"""
+    cat = FakeSnapshotCatalog()
+    cat.begin_caller("dp2.ingest")
+
+    def rows_of(name):
+        p = FIXTURES / f"{name}.csv"
+        if not p.is_file():  # water_injection_daily 无 fixture——湖侧走注入行
+            return []
+        with open(p, encoding="utf-8") as f:
+            return list(csv.DictReader(f))
+
+    injected = {
+        "well_overhaul": [{"well_id": "N-09", "overhaul_start": "2026-05-10",
+                           "overhaul_end": "2026-05-12", "overhaul_type": "检泵",
+                           "affected_output": "10.0", "batch_id": "20260510-T3"}],
+        "equip_status": [{"equip_id": "EQ-Z-09", "equip_type": "螺杆泵", "load": "60.0",
+                          "current": "24.0", "stop_reason_code": "X9"}],
+        "sensor_reading_subdaily": [{"well_id": "N-01", "channel_id": "N-01-TEMP",
+                                     "ts": f"2025-09-01T00:{m:02d}:00", "value": "0.0"}
+                                    for m in (0, 15, 30, 45, 60, 75, 90, 105)],
+        "water_injection_daily": [
+            {"well_id": "N-01", "prod_date": "2025-09-05", "inj_volume": "100"},
+            {"well_id": "N-01", "prod_date": "2025-09-06", "inj_volume": "500"},
+            {"well_id": "N-01", "prod_date": "2025-09-07", "inj_volume": "99999"}],
+        "monthly_settlement": [{"block_name": "渤中", "settle_date": "2025-09-30",
+                                "net_weight": "0.01"}],
+    }
+    for name in SCAN_TABLES_EIGHT:
+        data = rows_of(name) + injected.get(name, [])
+        schema = pa.schema([(k, pa.string()) for k in data[0]])
+        cat.create_table(name, schema=schema)
+        cat.append(name, pa.Table.from_pylist(data, schema=schema), commit_meta={})
+    return cat
 
 
 # ---------- (a) 拾取→执行→step=2 全链（M-05b 行形合同对账） --------------------
@@ -194,6 +241,53 @@ class TestPickupFullChain:
     def test_unconfigured_store_honest_skip(self):
         summary = run_pickup_once(cfg(None), bundle=bundle())
         assert summary["picked"] == [] and "skipped" in summary["note"]
+
+
+# ---------- (a2) 扫描面解耦（DP-07 F-01） ----------------------------------------
+
+
+class TestScanSurface:
+    """F-01（DP-07 全量审查 R-DP F-01）：拾取复扫的扫描面缺省＝全部受检 8 表——
+    与进料面（DP_PIPELINE_TABLES，agg 两源）解耦；规则 6/8/11/12/15/19 在扫描面
+    真跑（fixture＋定向坏行注入），报告 range 按实扫表数动态生成。"""
+
+    def test_scan_surface_defaults_to_all_checked_tables_rules_really_run(self):
+        """扫描面全 8 表入湖：六条原「结构性空跑恒绿」规则真跑出命中——M-05b 复扫
+        对规则 8 设备码单的假绿面（扫描面无 equip_status → 永不进 hits）随之封死。"""
+        cat = _lake_with_scan_surface()
+        store = FakePickupStore(enabled_nos=(2, 6, 8, 11, 12, 15, 19))
+        tid = "QT-20261004-16"
+        store.add_task(tid, time=HOUR_AGO)
+        summary = run_pickup_once(cfg(store, catalog_factory=lambda: cat))
+        assert summary["bundle_tables"] == sorted(SCAN_TABLES_EIGHT)   # 扫描面全 8 表
+        report = report_of(store, tid)
+        assert set(report["tables"]) == set(SCAN_TABLES_EIGHT)
+        assert report["range"] == "生产库 8 表"                         # 实扫表数动态生成
+        assert {h["rule_no"] for h in report["hits"]} == {6, 8, 11, 12, 15, 19}
+        assert all(h["hit_count"] >= 1 for h in report["hits"])        # 真命中非空跑
+        assert {q["rule_no"] for q in store.quarantine} == {8}         # 隔离档（rule-8）
+        assert report["quarantined_rows"] == len(store.quarantine) == 1
+
+    def test_report_range_dynamic_not_static_eight(self):
+        """range 串断言：bundle 两表时如实「生产库 2 表」——不再静态宣称「生产库 8 表」。"""
+        store = FakePickupStore()
+        tid = "QT-20261004-17"
+        store.add_task(tid, time=HOUR_AGO)
+        b = bundle(dirty=True)
+        run_pickup_once(cfg(store), bundle={k: b[k] for k in ("oil_production_daily",
+                                                              "well_info")})
+        report = report_of(store, tid)
+        assert report["range"] == "生产库 2 表"
+        assert set(report["tables"]) == {"oil_production_daily", "well_info"}
+
+    def test_scan_tables_literal_matches_quality_store_domain(self):
+        """worker 扫描面字面与 quality_store.SCAN_TABLES／_RULE_TABLE 主表值域同域
+        （worker 模块保持零顶层 app 依赖——一致性由本钉子测试看守）。"""
+        from app.data_plane.quality_store import SCAN_TABLES, _RULE_TABLE
+        from worker.scheduler import _SCAN_TABLES
+        assert set(_SCAN_TABLES) == set(SCAN_TABLES)            # worker 字面与 quality 真源同域
+        assert set(_RULE_TABLE.values()) <= set(_SCAN_TABLES)   # 扫描面盖住全部规则主表
+        assert len(_SCAN_TABLES) == 8                           # 001 八张 as-is 源表全量
 
 
 def report_of(store: FakePickupStore, task_id: str) -> dict:
@@ -268,6 +362,20 @@ class TestQuarantineIdempotency:
         run_pickup_once(cfg(store), bundle=b)
         assert len(store.quarantine) == 2            # 两坏行两键＝两行（不吞）
         assert len({(q["loc"], str(q["payload"].get("well_id"))) for q in store.quarantine}) == 2
+
+    def test_same_key_bad_rows_report_matches_physical(self):
+        """F-04（DP-07）：同批完全同值 twin 坏行（同键同值本就同问题）——报告计数按
+        寻址键去重口径，报告=物理（幂等落表物理 1 行，报告不再虚计 2——对账边缘不破）。"""
+        store = FakePickupStore()
+        tid = "QT-20261004-14"
+        store.add_task(tid, time=HOUR_AGO)
+        b = bundle(dirty=False)
+        rows = b["oil_production_daily"]
+        twin = dict(rows[0], oil_output=None, well_id="Z-96", prod_date="2025-09-28")
+        b["oil_production_daily"] = rows + [twin, dict(twin)]   # 同批同键坏行×2
+        run_pickup_once(cfg(store), bundle=b)
+        assert len(store.quarantine) == 1                        # 物理 1 行（幂等寻址）
+        assert report_of(store, tid)["quarantined_rows"] == 1    # 报告=物理（F-04 对账）
 
 
 def test_pending_tasks_has_no_dead_now_param():

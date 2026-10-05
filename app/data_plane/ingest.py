@@ -83,6 +83,11 @@ class Ingest:
         self.catalog = catalog          # dp1 门面（append 身份由本模块声明）
         self._registry = freshness      # FreshnessRegistry seam（替身|PG 真身）；名字避开 freshness() 方法（属性冲突教训）
         self._rules = rules or {}       # 表 → 质量规则清单（入湖必过质检）
+        # 闸后净批（DP-07 F-03）：表 → 最近一次成功落位的行（质检通过后的实落内容）——
+        # 「落位后口径」消费面（worker 报水位）取此批，不取闸前原始行（坏行恰为该批
+        # 最新业务日期行时原始行口径会虚标水位——单调不回退将其锁死）。Ingest 逐周期
+        # 新建，无跨周期残留。
+        self.landed: dict[str, list[dict]] = {}
 
     def run_batch_load(self, table: str, records, provenance: Provenance,
                        *, source: str | None = None, batch_id: str | None = None):
@@ -125,6 +130,7 @@ class Ingest:
             "source": source,
             "batch_id": batch_id,
             "manifest": _lineage_manifest(table, batch_id, source, records.column_names)})
+        self.landed[table] = cleaned.to_pylist()  # 闸后净批（F-03：落位口径消费面）
         # P6 修复（DP-04，盘点 A 组点名 as_of 虚标）：登记 as_of 读**快照账 committed_at**
         # （manifest 随行落账时刻＝数据真实生效时刻），不再取登记动作的墙钟 now()——
         # 登记晚于提交时（重试/积压/重启追赶）不再把新鲜度虚标到登记瞬间。

@@ -409,6 +409,115 @@ class TestTaskPickup:
         assert (row[0], row[1]) == ("running", 1)                  # 在途行原样（执行中）
 
 
+# ---------- DP-07：F-02 取号竞窗自愈 ＋ F-04 同键坏行对账（rev 发现清单修复回归钉） ----
+
+
+class TestTaskNumberRace:
+    """F-02（DP-07）：create_task 当日取号的跨服务竞窗（计数→INSERT 两步间他服务抢注
+    同号）——IntegrityError 单次重试自愈（重读当日计数取下一号），不崩且序号连续
+    （主仓 M-05b accept_task 的 IntegrityError 处置先例同款语义）。"""
+
+    def test_race_collision_retries_to_next_seq(self, store, monkeypatch):
+        dsn = TEST_DSN
+        real_connect = store._connect
+        state: dict = {"day": None, "injected": False}
+
+        class _RaceCursor:
+            """竞窗注入光标：clock 查询记当日号段；count 查询的 fetchone 返回前，他服务
+            连接抢注下一号（计数后、INSERT 前的窄窗）——create_task 随即撞 PK。"""
+
+            def __init__(self, cur):
+                self._cur = cur
+                self._arm = None
+
+            def execute(self, sql, params=None):
+                if "SELECT now() AT TIME ZONE" in sql:
+                    self._arm = "clock"
+                elif "SELECT count(*) FROM quality_task" in sql:
+                    self._arm = "count"
+                else:
+                    self._arm = None
+                return self._cur.execute(sql, params)
+
+            def fetchone(self):
+                row = self._cur.fetchone()
+                if row is not None and self._arm == "clock":
+                    state["day"] = row[0].strftime("%Y%m%d")
+                elif (row is not None and self._arm == "count"
+                      and not state["injected"]):
+                    state["injected"] = True
+                    with psycopg.connect(dsn) as c2, c2.cursor() as c2cur:
+                        c2cur.execute(
+                            "INSERT INTO quality_task (id, status, step, rules_count, time) "
+                            "VALUES (%s, 'running', 1, 0, now())",
+                            (f"QT-{state['day']}-{row[0] + 1:02d}",))  # 抢注 create_task 将取的号
+                return row
+
+            def __enter__(self):
+                self._cur.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._cur.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(self._cur, name)
+
+        class _RaceConn:
+            def __init__(self, conn):
+                self._conn = conn
+
+            def cursor(self):
+                return _RaceCursor(self._conn.cursor())
+
+            def __enter__(self):
+                self._conn.__enter__()
+                return self
+
+            def __exit__(self, *exc):
+                return self._conn.__exit__(*exc)
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        monkeypatch.setattr(store, "_connect", lambda: _RaceConn(real_connect()))
+        try:
+            tid = store.create_task(12)
+            assert tid == f"QT-{state['day']}-02"              # 被抢注的 -01 让位——重试自愈不崩
+            rows = _q("SELECT id FROM quality_task WHERE id LIKE %s ORDER BY id",
+                      (f"QT-{state['day']}-%",))
+            assert [r[0] for r in rows] == [f"QT-{state['day']}-01",
+                                            f"QT-{state['day']}-02"]   # 序号连续无空洞
+        finally:
+            _q("DELETE FROM quarantine_row WHERE batch_id LIKE %s", (f"QT-{state['day']}-%",))
+            _q("DELETE FROM quality_task WHERE id LIKE %s", (f"QT-{state['day']}-%",))
+
+
+class TestSameKeyQuarantineCount:
+    """F-04（DP-07）：同批完全同值 twin 坏行——报告计数按寻址键去重口径，报告=物理
+    （幂等寻址下物理只落 1 行，报告不再虚计 2——报告×物理行数对账在同键边缘不破）。"""
+
+    def test_same_key_bad_rows_report_matches_physical_count(self, store):
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-99"
+        _q("INSERT INTO quality_task (id, status, step, rules_count, time) "
+           "VALUES (%s, 'running', 1, 12, now())", (tid,))         # 受理行形直插
+        b = _bundle(dirty=False)
+        rows = b["oil_production_daily"]
+        twin = dict(rows[0], oil_output=None, well_id="Z-95", prod_date="2025-09-26")
+        b["oil_production_daily"] = rows + [twin, dict(twin)]      # 同批同键坏行×2
+        try:
+            s = run_quality_task(store, b, task_id=tid)
+            qrows = _q("SELECT rule_no, loc, payload FROM quarantine_row WHERE batch_id=%s",
+                       (tid,))
+            assert len(qrows) == 1                                 # 物理 1 行（幂等寻址）
+            assert s["quarantined_rows"] == 1                      # 报告摘要=物理（F-04）
+            assert _q("SELECT (report->>'quarantined_rows')::int FROM quality_task "
+                      "WHERE id=%s", (tid,))[0][0] == 1            # 报告 1:1 同口径
+        finally:
+            _q("DELETE FROM quarantine_row WHERE batch_id=%s", (tid,))
+            _q("DELETE FROM quality_task WHERE id=%s", (tid,))
+
+
 def _shifted_host(shift: timedelta):
     """宿主机钟偏移模拟（F2 红先取证）：monkeypatch quality_store 模块全局 datetime——
     老实现 heal 从模块全局取宿主机钟；DB 钟实现不经过此名（偏移对其不可见）。"""

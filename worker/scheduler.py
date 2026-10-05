@@ -5,11 +5,16 @@
   register，闸在编排层——脏批拒绝入湖并记 rejected）；
   质检＝dp3 整队跑批**落库真身**（DP-05：读 quality_rule 当前启用集→quality_task 报告
   1:1→quarantine_row 隔离落行——原 validate_bundle 内存报告弃置路径清零，报告身份＝
-  QT 任务号，主平台 E2 质检台读同表同源）；
+  QT 任务号，主平台 E2 质检台读同表同源）；报告 range 按实扫表数动态生成（DP-07 F-01）；
   agg 刷新＝dp3 出汇总层（agg.py：湖 as-of 视图→星型构建→**限写三表专用账号**直写主平台库）；
   水位＝freshness 登记（进料侧 as_of=快照账 committed_at——P6 修复；汇总侧=刷新完成时刻）
-  ＋water_line 报水位（原始/清洗层=入湖水位、汇总层=agg 刷新水位——E2 行为约定 8，
+  ＋water_line 报水位（原始/清洗层=**闸后净批**落位批业务日期——DP-07 F-03：取落位批
+  不取闸前原始行，坏行恰为最新日期行时不再虚标；汇总层=agg 刷新水位——E2 行为约定 8，
   T-1 判定归 E2 端点 8 服务端算）。
+- 扫描面与进料面解耦（DP-07 F-01）：质检/拾取的扫描面缺省＝全部受检 8 表
+  （DP_SCAN_TABLES——与 quality_store.SCAN_TABLES 同域），进料面保持 DP_PIPELINE_TABLES
+  原语义（agg 两源）；扩进料表清单到无进料规则集的表不再 UnruledTableRejected 崩周期
+  （诚实跳过记摘要，闸 fail-closed 语义不变——表不入湖）。
 - 拾取作业（DP-06，与管道作业并列的第二只 APScheduler 作业）：周期轮询 quality_task
   的外部受理行（status='running' AND step=0——M-05b 冻结语义「step=0＝待拾取外部任务」，
   主平台 E2 accept_task 落行即触发面）→逐行认领（条件 UPDATE 原子闸，step 0→1）→
@@ -28,7 +33,10 @@
 - 框架红线：APScheduler＝ADR-0003 裁决 12 点名框架（真引入，依赖进 deploy/worker-requirements.txt）。
 - 调度配置外置（interval/cron 可配，环境变量；缺省管道日度 05:30、拾取 60s 间隔）：
     DP_PIPELINE_RUN_DIR        进料 run 目录（缺省 /data/runs）
-    DP_PIPELINE_TABLES         进料表清单（缺省 oil_production_daily,well_info——agg 两源）
+    DP_PIPELINE_TABLES         进料表清单（缺省 oil_production_daily,well_info——agg 两源；
+                               F-01 起仅承载进料面语义）
+    DP_SCAN_TABLES             质检/拾取扫描面表清单（缺省全部受检 8 表——独立于进料面，
+                               扩扫描面不再触发进料闸 UnruledTableRejected）
     DP_SCHED_TRIGGER           interval | cron（缺省 cron）
     DP_SCHED_INTERVAL_MINUTES  interval 触发间隔分钟（缺省 1440）
     DP_SCHED_CRON              cron 触发参数「k=v,k=v」形（缺省 hour=5,minute=30）
@@ -53,7 +61,13 @@ from pathlib import Path
 
 log = logging.getLogger("dp.worker")
 
-_SOURCE_TABLES = ("oil_production_daily", "well_info")  # agg 星型两源（99 册 §2.12）
+_SOURCE_TABLES = ("oil_production_daily", "well_info")  # agg 星型两源（99 册 §2.12）——进料面
+
+# 扫描面缺省＝全部受检 8 表（DP-07 F-01，与 quality_store.SCAN_TABLES／_RULE_TABLE 主表
+# 值域同域——字面在此保住 worker 模块零顶层 app 依赖，一致性由 tests/worker 钉子测试看守）。
+_SCAN_TABLES = ("oil_production_daily", "well_info", "water_injection_daily",
+                "well_overhaul", "equip_status", "fluid_test", "monthly_settlement",
+                "sensor_reading_subdaily")
 
 PICKUP_JOB_ID = "dp-task-pickup"
 
@@ -69,7 +83,8 @@ class PipelineConfig:
     freshness: object                      # FreshnessRegistry seam（替身|PG 真身）
     agg_writer: object | None = None       # AggStarWriter（未配 AGG_DATABASE_URL=None＝显式跳过）
     quality_store: object | None = None    # QualityStore（未配 QUALITY_DATABASE_URL=None＝质检落库/报水位显式跳过）
-    tables: tuple = _SOURCE_TABLES
+    tables: tuple = _SOURCE_TABLES         # 进料面（F-01：仅承载进料语义——agg 两源缺省）
+    scan_tables: tuple = _SCAN_TABLES      # 质检/拾取扫描面（F-01：缺省全部受检 8 表，独立于进料面）
     operator: str = "dp-scheduler"
     trigger: tuple = ("cron", {"hour": 5, "minute": 30})
     pickup_trigger: tuple = ("interval", {"seconds": 60})  # 拾取作业触发（DP-06）
@@ -106,35 +121,37 @@ def load_config(catalog_factory=None, freshness=None, agg_writer=None,
                                     cron_env="DP_PICKUP_CRON", cron_default="minute=*/1")
     tables = tuple(t.strip() for t in
                    os.environ.get("DP_PIPELINE_TABLES", ",".join(_SOURCE_TABLES)).split(",") if t.strip())
+    scan_tables = tuple(t.strip() for t in
+                        os.environ.get("DP_SCAN_TABLES", ",".join(_SCAN_TABLES)).split(",") if t.strip())
     return PipelineConfig(
         run_dir=Path(os.environ.get("DP_PIPELINE_RUN_DIR", "/data/runs")),
         freshness=freshness, agg_writer=agg_writer, quality_store=quality_store,
-        tables=tables, trigger=trigger, pickup_trigger=pickup_trigger,
+        tables=tables, scan_tables=scan_tables, trigger=trigger, pickup_trigger=pickup_trigger,
         stale_seconds=int(os.environ.get("DP_PICKUP_STALE_SECONDS", "3600")),
         catalog_factory=catalog_factory)
 
 
 def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
-    """一周期六件事；返回摘要（进料/质检落库/agg/水位各步如实记账——干跑证据载体）。"""
-    from app.data_plane.ingest import (BatchRejected, Ingest, Provenance)
+    """一周期六件事；返回摘要（进料/质检落库/agg/水位各步如实记账——干跑证据载体）。
+    扫描面＝cfg.scan_tables（F-01：全受检表），进料面＝cfg.tables（agg 两源原语义）。"""
+    from app.data_plane.ingest import (BatchRejected, Ingest, Provenance,
+                                       UnruledTableRejected)
     from app.data_plane.quality_store import data_date_of, run_quality_task
     from app.data_plane.transform import RULES_OIL_DAILY, RULES_WELL_INFO
 
     catalog = (catalog_factory or cfg.catalog_factory)()
     ing = Ingest(catalog=catalog, freshness=cfg.freshness, rules={
         "oil_production_daily": RULES_OIL_DAILY, "well_info": RULES_WELL_INFO})
-    summary: dict = {"ingested": [], "rejected": [], "agg": "skipped（未配 AGG_DATABASE_URL）",
-                     "freshness": cfg.freshness}
+    summary: dict = {"ingested": [], "rejected": [], "unruled_skipped": [],
+                     "agg": "skipped（未配 AGG_DATABASE_URL）", "freshness": cfg.freshness}
 
-    # ①＋② 日度进料（拉新批次）→清洗（闸后净批＝入湖内容，原始/清洗层水位同源）
+    # 质检扫描面（F-01：与进料面解耦——全受检表；缺 CSV 诚实跳过不虚报）
     bundle: dict[str, list[dict]] = {}
-    for name in cfg.tables:
+    for name in cfg.scan_tables:
         path = Path(cfg.run_dir) / f"{name}.csv"
-        if not path.is_file():
-            log.info("进料跳过：run 目录无 %s（%s）", name, path)
-            continue
-        with open(path, encoding="utf-8") as f:
-            bundle[name] = list(csv.DictReader(f))
+        if path.is_file():
+            with open(path, encoding="utf-8") as f:
+                bundle[name] = list(csv.DictReader(f))
 
     # ③ 质检跑批落库（DP-05：读启用集→QT 任务 1:1 报告→隔离区落行；未配＝显式跳过）
     task_id = None
@@ -154,14 +171,15 @@ def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
     for name in cfg.tables:
         path = Path(cfg.run_dir) / f"{name}.csv"
         if not path.is_file():
+            log.info("进料跳过：run 目录无 %s（%s）", name, path)
             continue
         try:  # 进料闸在编排层：脏批 BatchRejected＝拒绝入湖（append 不发生）
             snap = ing.run_csv_load(name, path, Provenance(
                 quality_report_id=quality_report_id, operator=cfg.operator))
             summary["ingested"].append(name)
             log.info("进料完成：%s → 快照 %s（as_of=%s）", name, snap.snapshot_id, snap.committed_at)
-            if cfg.quality_store is not None:  # ⑥ 报水位：原始/清洗层＝入湖水位（闸后净批）
-                day = data_date_of(name, bundle[name])
+            if cfg.quality_store is not None:  # ⑥ 报水位：原始/清洗层＝闸后净批（F-03：落位批）
+                day = data_date_of(name, ing.landed.get(name) or [])
                 for layer in ("原始层", "清洗层"):
                     advanced = cfg.quality_store.raise_water_line(layer, day)
                     log.info("水位回写：%s → %s%s", layer, day,
@@ -169,6 +187,9 @@ def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
         except BatchRejected as e:
             summary["rejected"].append(name)
             log.warning("进料拒绝：%s（质检 rule_ids=%s）", name, e.report.rule_ids)
+        except UnruledTableRejected as e:  # F-01：进料面扩表不再崩周期——诚实跳过
+            summary["unruled_skipped"].append(name)
+            log.warning("进料跳过：%s（%s）——表未登记进料规则集（fail-closed 不入湖）", name, e)
 
     # ④＋⑤＋⑥ agg 刷新（限写账号直写主平台库）→ 水位登记（freshness）→ 汇总层报水位
     if cfg.agg_writer is None:
@@ -184,7 +205,8 @@ def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
 
 def lake_bundle(catalog, tables: tuple) -> dict:
     """湖 as-of 当前视图 → 质检 bundle（拾取数据面——修正批次随进料入湖后可复扫）；
-    湖中缺表＝诚实跳过（规则按 bundle.get(表,[]) 空跑——不虚报该表扫描）。"""
+    湖中缺表＝诚实跳过（规则按 bundle.get(表,[]) 空跑——不虚报该表扫描）。
+    表清单＝扫描面（F-01：DP_SCAN_TABLES 全受检表——独立于进料面两源）。"""
     bundle: dict[str, list[dict]] = {}
     for name in tables:
         try:
@@ -211,6 +233,8 @@ def run_pickup_once(cfg: PipelineConfig, catalog_factory=None,
     - 执行中断＝行如实停 step=1（不造假完成），下周期自愈重拾（重试回路）；
     - 假绿防线：bundle 空（湖无数据）＝本周期不拾取——空扫描报告会被复扫通道判成
       全绿（宁缺不造假结论；行留 step=0，复扫通道照旧诚实 501）。
+    - 扫描面（DP-07 F-01）：湖 bundle 取 cfg.scan_tables（全部受检 8 表）——规则 6/8/
+      11/12/15/19 在扫描面真跑，M-05b 复扫对其表来源问题单（含预置单）不再假绿。
     返回摘要（picked/healed/failed/bundle_tables——干跑证据载体）。"""
     from app.data_plane.quality_store import run_quality_task
     summary: dict = {"picked": [], "healed": [], "failed": [], "bundle_tables": []}
@@ -224,7 +248,7 @@ def run_pickup_once(cfg: PipelineConfig, catalog_factory=None,
                     len(healed), cfg.stale_seconds, healed)
     if bundle is None:
         catalog = (catalog_factory or cfg.catalog_factory)()
-        bundle = lake_bundle(catalog, cfg.tables)
+        bundle = lake_bundle(catalog, cfg.scan_tables)
     summary["bundle_tables"] = sorted(bundle)
     if not bundle or not any(bundle.values()):
         log.warning("拾取跳过：湖视图空——不产空扫描报告（假绿防线），%d 行候选原样待拾取",

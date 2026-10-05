@@ -13,7 +13,8 @@
 - 规则执行体＝transform.RULES_FULL（rule-N ↔ quality_rule.no 同号同源——种子由主仓迁移
   0015 自本体 bohai M3 投影（E2 行为约定 9 权威源），规则 13-20 仅登记不实施＝种子
   enabled=false，V1 任务只跑启用集）。
-- 水位（E2 行为约定 8）：原始/清洗层＝入湖管道回写（进料闸后净批），汇总层＝agg 刷新
+- 水位（E2 行为约定 8）：原始/清洗层＝入湖管道回写（进料闸后净批——DP-07 F-03 起
+  worker 消费 Ingest.landed 落位批，非闸前原始行），汇总层＝agg 刷新
   水位；water_line 单调不回退（同层旧数据日期不覆盖新水位）；promise=T-1 常量随迁移
   落默认值，T-1 达标判定后端算归 E2 端点 8（本票只报水位不判达标）。
 - 内存弃置路径清零（DP-05 验收 2）：质检跑批不再产内存 QualityReport——报告身份＝
@@ -45,6 +46,12 @@ _TABLE_LABEL = {"oil_production_daily": "生产日报", "well_info": "井档案"
                 "water_injection_daily": "注水日报", "well_overhaul": "检修台账",
                 "equip_status": "设备状态", "fluid_test": "化验样",
                 "monthly_settlement": "月度结算", "sensor_reading_subdaily": "传感读数"}
+
+# 扫描面全集（DP-07 F-01）：拾取复扫与管道质检的受检表＝001 八张 as-is 源表
+# （99 册 §2.0；与 _TABLE_LABEL 键域／_RULE_TABLE 主表值域同源）——**独立于进料面**
+# （worker 进料面 DP_PIPELINE_TABLES 保持 agg 两源原语义），扩扫描面不再借道进料变量
+# （进料闸 UnruledTableRejected 崩周期随之封死）。
+SCAN_TABLES: tuple[str, ...] = tuple(_TABLE_LABEL)
 
 # 各表业务日期键（water_line data_date 提取；_BUSINESS_KEYS 日期族——无日期键的表
 # 不产出水位主张：宁缺不虚标，P6 同款纪律）
@@ -108,6 +115,27 @@ def _issue_key(rule_no: int, locator: dict) -> tuple:
     return (rule_no, ident)
 
 
+def _addressing_key(r: dict) -> tuple:
+    """隔离行寻址键（append_quarantine 幂等寻址同款五元组；payload 经 JSON 归一）。"""
+    return (r["batch_id"], r["rule_no"], r["action"], r.get("loc"), _json_dumps(r["payload"]))
+
+
+def _dedupe_addressing(rows: list[dict]) -> list[dict]:
+    """同批同键坏行去重（DP-07 F-04）：完全同值 twin 坏行（同批同键同 payload）只计
+    一——append_quarantine 幂等寻址下物理只落一行，报告计数按寻址键去重后口径
+    （**报告=物理**，报告×物理行数对账在同键边缘不破）；异键坏行不吞（append-only
+    语义不变，真坏行一行不丢）。"""
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for r in rows:
+        key = _addressing_key(r)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+
 def evaluate_enabled(bundle: dict, specs: list[dict]) -> list[tuple[dict, RuleOutcome]]:
     """按启用规则集跑整队质检（纯计算）：返回 (规则 spec, 单规则裁决) 序列。
 
@@ -164,22 +192,34 @@ class QualityStore:
 
     def create_task(self, rules_count: int, *, now: datetime | None = None) -> str:
         """建任务行（status=running, step=1）；任务号 QT-YYYYMMDD-NN 当日序号递增
-        （E2 端点 3 任务号规则；同刻多任务由 PK 兜底——worker max_instances=1 单飞）。
+        （E2 端点 3 任务号规则；同刻多任务由 PK 兜底）。
         钟源契约（DP-06.fix F2）：行 time＝**数据库东八区钟** now() AT TIME ZONE
         'Asia/Shanghai'（naive）——与外部受理行写入口径（主仓 infra.clock EAST8）同源，
-        宿主机时区零耦合；now 显式传参＝测试回放缝。"""
-        with self._connect() as conn, conn.cursor() as cur:
-            if now is None:
-                cur.execute("SELECT now() AT TIME ZONE 'Asia/Shanghai'")
-                now = cur.fetchone()[0]
-            ts = now.replace(microsecond=0)
-            day = ts.strftime("%Y%m%d")
-            cur.execute("SELECT count(*) FROM quality_task WHERE id LIKE %s",
-                        (f"QT-{day}-%",))
-            task_id = f"QT-{day}-{cur.fetchone()[0] + 1:02d}"
-            cur.execute("INSERT INTO quality_task (id, status, step, rules_count, time) "
-                        "VALUES (%s, 'running', 1, %s, %s)", (task_id, rules_count, ts))
-        return task_id
+        宿主机时区零耦合；now 显式传参＝测试回放缝。
+        取号竞窗自愈（DP-07 F-02，主仓 M-05b accept_task 的 IntegrityError 处置先例
+        同款）：计数→INSERT 两步间他服务（E2 受理）可抢注同号撞 PK—— IntegrityError
+        **单次重试**（重读当日计数取下一号，序号连续无空洞）；两撞仍败＝如实上抛
+        （管道拾取面沿 run_pickup_once 执行中断通道——行停 step=1 自愈重拾）。"""
+        import psycopg
+
+        last: Exception | None = None
+        for _attempt in range(2):  # 首取＋单次重试（F-02）
+            try:
+                with self._connect() as conn, conn.cursor() as cur:
+                    if now is None:
+                        cur.execute("SELECT now() AT TIME ZONE 'Asia/Shanghai'")
+                        now = cur.fetchone()[0]
+                    ts = now.replace(microsecond=0)
+                    day = ts.strftime("%Y%m%d")
+                    cur.execute("SELECT count(*) FROM quality_task WHERE id LIKE %s",
+                                (f"QT-{day}-%",))
+                    task_id = f"QT-{day}-{cur.fetchone()[0] + 1:02d}"
+                    cur.execute("INSERT INTO quality_task (id, status, step, rules_count, time) "
+                                "VALUES (%s, 'running', 1, %s, %s)", (task_id, rules_count, ts))
+                return task_id
+            except psycopg.errors.IntegrityError as e:  # 并发取号撞 PK——重读计数取下一号
+                last = e
+        raise last  # type: ignore[misc]
 
     def finish_task(self, task_id: str, *, hits: int, report: dict,
                     step: int = 2) -> None:
@@ -291,7 +331,10 @@ def run_quality_task(store, bundle: dict, *, scanned: dict | None = None,
     外部受理行**（E2 accept_task 落的 running/step=0 行，拾取器先经 claim_task 认领
     至 step=1），完成后 finish_task 照写 done/step=2——受理行的 rules_count/time 原
     样不动；verdict_note＝报告头注记（报告键集不变，只续写 verdict 文案——行形合同
-    零偏差）。"""
+    零偏差）。
+    DP-07：range＝按实扫表数动态生成（F-01——bundle/scanned 实有表数，不再静态宣称
+    「生产库 8 表」）；隔离行先按寻址键去重再落库计数（F-04——同批完全同值 twin 坏行
+    只计一，报告=物理，报告×物理行数对账在同键边缘不破）。"""
     specs = store.enabled_rules()
     if task_id is None:
         task_id = store.create_task(rules_count=len(specs))
@@ -320,11 +363,13 @@ def run_quality_task(store, bundle: dict, *, scanned: dict | None = None,
         hits_detail.append({"rule_no": spec["no"], "kind": spec["kind"],
                             "action": spec["action"], "hit_count": outcome.hit_count,
                             "sample": outcome.locators[:5]})
+    qrows = _dedupe_addressing(qrows)  # F-04：同批同键坏行去重——报告=物理
     store.append_quarantine(qrows)
 
+    tables_view = scanned or {t: len(r) for t, r in bundle.items()}
     report = {
-        "range": "生产库 8 表",
-        "tables": scanned or {t: len(r) for t, r in bundle.items()},
+        "range": f"生产库 {len(tables_view)} 表",   # F-01：按实扫表数动态生成（不再静态宣称 8 表）
+        "tables": tables_view,
         "scanned_rows": sum(len(r) for r in bundle.values()),
         "rules_run": len(pairs),
         "quarantined_rows": len(qrows),           # 99 册合同键（数据粒度）
