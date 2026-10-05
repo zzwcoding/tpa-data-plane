@@ -72,9 +72,8 @@ class FakePickupStore:
         row["step"] = 1
         return True
 
-    def heal_stale_tasks(self, *, older_than_seconds: int,
-                         now: datetime | None = None) -> list[str]:
-        cutoff = (now or datetime.now()) - timedelta(seconds=older_than_seconds)
+    def heal_stale_tasks(self, *, older_than_seconds: int) -> list[str]:
+        cutoff = datetime.now() - timedelta(seconds=older_than_seconds)
         healed = []
         for row in self.rows.values():
             if (row["status"] == "running" and row["step"] == 1
@@ -90,8 +89,18 @@ class FakePickupStore:
         row.update(status="done", step=step, hits=hits, report=report)
 
     def append_quarantine(self, rows: list[dict]) -> int:
-        self.quarantine.extend(rows)
-        return len(rows)
+        """隔离行幂等落表替身（与 QualityStore.append_quarantine 同构——F1）：按寻址键
+        (batch_id, rule_no, action, loc, payload) 去重——同键重放不重复落行（自愈重拾
+        的 at-least-once 执行不重复落区）；异键照追加（append-only 对真坏行不变）。"""
+        inserted = 0
+        for r in rows:
+            if any(q["batch_id"] == r["batch_id"] and q["rule_no"] == r["rule_no"]
+                   and q["action"] == r["action"] and q.get("loc") == r.get("loc")
+                   and q["payload"] == r["payload"] for q in self.quarantine):
+                continue
+            self.quarantine.append(r)
+            inserted += 1
+        return inserted
 
 
 def bundle(dirty: bool = True) -> dict:
@@ -225,6 +234,48 @@ class TestStaleRowHealing:
         s2 = run_pickup_once(cfg(store, stale_seconds=0), bundle=bundle())  # 阈值过尽
         assert s2["healed"] == [tid] and s2["failed"] == [tid]          # 自愈重拾再炸——诚实循环
         assert store.rows[tid]["status"] == "running"                    # 不落假 done
+
+
+# ---------- (b2) 隔离行幂等（DP-06.fix F1——rev 复现形的回归钉） ------------------
+
+
+class TestQuarantineIdempotency:
+    def test_heal_repick_does_not_double_quarantine_rows(self):
+        """F1（DP-06.rev）：自愈重拾＝at-least-once 执行——append 后 finish 前中断，
+        次周期重执行同任务不得重复落同寻址键隔离行；报告计数×物理行数对账保持。"""
+        store = FakePickupStore(fail_on=("QT-20261004-12",))
+        tid = "QT-20261004-12"
+        store.add_task(tid, time=HOUR_AGO)
+        s1 = run_pickup_once(cfg(store, stale_seconds=3600), bundle=bundle())
+        assert s1["failed"] == [tid]
+        assert len(store.quarantine) == 1            # 隔离行已落、finish 未竟（部分写现场）
+        store._fail_on.clear()                       # 闪断修复
+        s2 = run_pickup_once(cfg(store, stale_seconds=0), bundle=bundle())  # 自愈重拾重执行
+        assert s2["healed"] == [tid] and s2["picked"]
+        assert len(store.quarantine) == 1            # F1：同键不重复落行（两周期 1→1 不翻倍）
+        assert report_of(store, tid)["quarantined_rows"] == len(store.quarantine) == 1
+
+    def test_different_addressing_rows_still_append(self):
+        """F1 边界：幂等只吞同寻址键——异键坏行照常落行（append-only 对真坏行不变）。"""
+        store = FakePickupStore()
+        tid = "QT-20261004-13"
+        store.add_task(tid, time=HOUR_AGO)
+        b = bundle(dirty=False)
+        rows = b["oil_production_daily"]
+        b["oil_production_daily"] = rows + [
+            dict(rows[0], oil_output=None, well_id="Z-97", prod_date="2025-09-29"),
+            dict(rows[0], oil_output=None, well_id="Z-98", prod_date="2025-09-30")]
+        run_pickup_once(cfg(store), bundle=b)
+        assert len(store.quarantine) == 2            # 两坏行两键＝两行（不吞）
+        assert len({(q["loc"], str(q["payload"].get("well_id"))) for q in store.quarantine}) == 2
+
+
+def test_pending_tasks_has_no_dead_now_param():
+    """F3（DP-06.rev）：pending_tasks 死参 now 清除——与替身两形对称
+    （签名误导面清除：拾取候选无 staleness 过滤）。"""
+    import inspect
+    from app.data_plane.quality_store import QualityStore
+    assert "now" not in inspect.signature(QualityStore.pending_tasks).parameters
 
 
 # ---------- (c) 防重复拾取 -----------------------------------------------------

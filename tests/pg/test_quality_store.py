@@ -21,6 +21,7 @@ import pytest
 
 psycopg = pytest.importorskip("psycopg")
 
+from app.data_plane import quality_store as quality_store_mod
 from app.data_plane.quality_store import QualityStore, data_date_of, run_quality_task
 
 TEST_DSN = os.environ.get("TEST_DATABASE_URL")
@@ -233,6 +234,25 @@ class TestRestrictedWriterAccount:
         self._denied(dsn, "UPDATE quarantine_row SET loc='hacked' WHERE id=1")
         self._denied(dsn, "DELETE FROM quarantine_row WHERE id=1")
 
+    def test_quarantine_idempotent_append_under_restricted_account(self, writer_role):
+        """F1（DP-06.fix）：幂等落库＝先查后插——限写账号需 quarantine_row 读权
+        （寻址键比对）；append-only 不松（UPDATE/DELETE 仍拒，见上测）。"""
+        dsn = writer_role
+        store = QualityStore(dsn)
+        row = {"batch_id": "QT-probe-02", "rule_no": 2, "action": "隔离",
+               "loc": "生产日报 · Z-98 · 2025-09-30",
+               "payload": {"well_id": "Z-98", "oil_output": None}}
+        try:
+            assert store.append_quarantine([row]) == 1             # 首插 1
+            assert store.append_quarantine([row]) == 0             # 同键重放＝0（F1 幂等）
+            assert store.append_quarantine(
+                [dict(row, loc="生产日报 · Z-97 · 2025-09-29")]) == 1  # 异键照插（不吞真坏行）
+            n = _q("SELECT count(*) FROM quarantine_row WHERE batch_id='QT-probe-02'")[0][0]
+            assert n == 2
+        finally:
+            _q("DELETE FROM quarantine_row WHERE batch_id='QT-probe-02'")
+        assert _q("SELECT count(*) FROM quarantine_row WHERE batch_id='QT-probe-02'")[0][0] == 0
+
     def test_outside_tables_denied(self, writer_role):
         dsn = writer_role
         self._denied(dsn, "INSERT INTO raw.oil_production_daily "
@@ -243,17 +263,20 @@ class TestRestrictedWriterAccount:
         self._denied(dsn, "ALTER TABLE quality_task ADD COLUMN hack int")          # 无 ALTER
 
     def test_template_grants_are_closed_world(self):
-        """模板闭世界机判：授权恰 6 句——rule 只读＋task 写读＋quarantine 仅 INSERT
-        （bigserial 序列 USAGE 随 INSERT 需要）＋water 写读。"""
+        """模板闭世界机判：授权恰 7 句——rule 只读＋task 写读＋quarantine 幂等读＋仅
+        INSERT（bigserial 序列 USAGE 随 INSERT 需要）＋water 写读。F1 幂等寻址需
+        quarantine_row 读权（先查后插）；UPDATE/DELETE 仍零授权（append-only 不松）。"""
         tpl = (Path(__file__).resolve().parents[1] / ".." / "migrations"
                / "quality_writer.sql").read_text(encoding="utf-8")
         grant_lines = [l.rstrip(";") for l in tpl.splitlines() if l.strip().startswith("GRANT")]
-        assert len(grant_lines) == 6
+        assert len(grant_lines) == 7
         assert "GRANT SELECT ON quality_rule TO tpa_quality_writer" in grant_lines
+        assert "GRANT SELECT ON quarantine_row TO tpa_quality_writer" in grant_lines
         assert "GRANT INSERT ON quarantine_row TO tpa_quality_writer" in grant_lines
         assert "GRANT USAGE, SELECT ON SEQUENCE quarantine_row_id_seq TO tpa_quality_writer" \
             in grant_lines
         assert not any("UPDATE" in l and "quarantine_row" in l for l in grant_lines)
+        assert not any("DELETE" in l and "quarantine_row" in l for l in grant_lines)
         assert not any("UPDATE" in l and "quality_rule" in l for l in grant_lines)
 
 
@@ -337,3 +360,62 @@ class TestTaskPickup:
         assert self._row(tid)[:2] == ("done", 2)
         assert self._row(fresh)[1] == 1                            # 在途行不被自愈
         assert self._row(fresh)[0] == "running"
+
+    # ---- DP-06.fix：F1 隔离行幂等 ＋ F2 heal 时钟源（rev 发现清单修复回归钉） ----
+
+    def test_reexecution_does_not_duplicate_quarantine_rows(self, store):
+        """F1（DP-06.rev）：at-least-once 重执行（append 后 finish 前中断→自愈重拾）——
+        同任务重执行不得重复落同寻址键隔离行；报告计数×物理行数对账保持。"""
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-96"
+        self._accept(tid, minutes_ago=120)
+        s1 = run_quality_task(store, _bundle(), task_id=tid)       # 首执行（隔离行已落）
+        assert s1["quarantined_rows"] == 1
+        _q("UPDATE quality_task SET status='running', step=0 WHERE id=%s", (tid,))  # 残行回卷
+        summary = self._pickup(store)                              # 次周期重拾重执行
+        assert [p["task_id"] for p in summary["picked"]] == [tid]
+        rows = _q("SELECT rule_no, loc, payload FROM quarantine_row WHERE batch_id=%s", (tid,))
+        assert len(rows) == s1["quarantined_rows"] == 1            # 两周期 1→1 不翻倍（F1）
+        assert self._row(tid)[4]["quarantined_rows"] == len(rows)  # 报告×物理对账
+
+    def test_heal_judgment_reads_db_clock_survives_host_shift(self, store, monkeypatch):
+        """F2（DP-06.rev）：heal 阈值比较钟＝数据库东八区钟（与受理行 time 写入口径
+        同源）——宿主机钟偏移（TZ≠部署时区模拟）不使阈值失效。受理行按 DB 东八区钟落
+        （主仓 infra.clock 同源口径）；老实现拿宿主机 naive 钟比较，偏移钟下残行判
+        「恒新鲜」永不自愈——此处红先。"""
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-97"
+        _q("INSERT INTO quality_task (id, status, step, rules_count, time) VALUES "
+           "(%s, 'running', 1, 12, (now() AT TIME ZONE 'Asia/Shanghai') - interval '2 hours')",
+           (tid,))
+        monkeypatch.setattr(quality_store_mod, "datetime",
+                            _shifted_host(timedelta(hours=-8)))    # 宿主机钟慢 8h（UTC 容器形）
+        summary = self._pickup(store)
+        assert summary["healed"] == [tid]                          # DB 钟判定：2h 前残行照常自愈
+        assert [p["task_id"] for p in summary["picked"]] == [tid]
+        assert self._row(tid)[:2] == ("done", 2)
+
+    def test_inflight_row_not_healed_under_host_shift(self, store, monkeypatch):
+        """F2 另一半（rev「在途行 60s 内可被误重置」放大半边）：宿主机钟「快」于行写入
+        钟时，在途行不得被误判超阈——老实现拿宿主机钟比较会把刚认领的行立即重置
+        →双执行。新实现读 DB 钟——不受宿主机偏移影响。"""
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-98"
+        _q("INSERT INTO quality_task (id, status, step, rules_count, time) VALUES "
+           "(%s, 'running', 1, 12, (now() AT TIME ZONE 'Asia/Shanghai') - interval '30 seconds')",
+           (tid,))
+        monkeypatch.setattr(quality_store_mod, "datetime",
+                            _shifted_host(timedelta(hours=1)))     # 宿主机钟快 1h（TZ=UTC+9 形）
+        summary = self._pickup(store)
+        assert summary["healed"] == [] and summary["picked"] == []
+        row = self._row(tid)
+        assert (row[0], row[1]) == ("running", 1)                  # 在途行原样（执行中）
+
+
+def _shifted_host(shift: timedelta):
+    """宿主机钟偏移模拟（F2 红先取证）：monkeypatch quality_store 模块全局 datetime——
+    老实现 heal 从模块全局取宿主机钟；DB 钟实现不经过此名（偏移对其不可见）。"""
+    class _Shifted(datetime):
+        _shift = shift
+
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.now(tz) + cls._shift
+    return _Shifted

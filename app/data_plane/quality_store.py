@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 
 from app.data_plane.transform import RULES_FULL, RuleOutcome, evaluate_bundle
 
@@ -127,9 +127,10 @@ def evaluate_enabled(bundle: dict, specs: list[dict]) -> list[tuple[dict, RuleOu
 class QualityStore:
     """主平台库 quality 表族＋water_line 的数据面写读面（限写账号语义的应用侧半边）。
 
-    写面：quality_task（INSERT 建任务＋UPDATE 完任务）/quarantine_row（仅 INSERT——
-    append-only）/water_line（upsert 单调）；读面：quality_rule 启用集（只读）＋
-    quality_task 当日序号寻址。越界由账号授权拒绝（quality_writer.sql 闭世界）。"""
+    写面：quality_task（INSERT 建任务＋UPDATE 完任务）/quarantine_row（仅 INSERT
+    不改写——append-only；F1 幂等寻址附读权比对，不同寻址键照常追加）/water_line
+    （upsert 单调）；读面：quality_rule 启用集（只读）＋quality_task 当日序号寻址。
+    越界由账号授权拒绝（quality_writer.sql 闭世界）。"""
 
     def __init__(self, dsn: str):
         self._dsn = dsn
@@ -163,10 +164,16 @@ class QualityStore:
 
     def create_task(self, rules_count: int, *, now: datetime | None = None) -> str:
         """建任务行（status=running, step=1）；任务号 QT-YYYYMMDD-NN 当日序号递增
-        （E2 端点 3 任务号规则；同刻多任务由 PK 兜底——worker max_instances=1 单飞）。"""
-        ts = (now or datetime.now()).replace(microsecond=0)
-        day = ts.strftime("%Y%m%d")
+        （E2 端点 3 任务号规则；同刻多任务由 PK 兜底——worker max_instances=1 单飞）。
+        钟源契约（DP-06.fix F2）：行 time＝**数据库东八区钟** now() AT TIME ZONE
+        'Asia/Shanghai'（naive）——与外部受理行写入口径（主仓 infra.clock EAST8）同源，
+        宿主机时区零耦合；now 显式传参＝测试回放缝。"""
         with self._connect() as conn, conn.cursor() as cur:
+            if now is None:
+                cur.execute("SELECT now() AT TIME ZONE 'Asia/Shanghai'")
+                now = cur.fetchone()[0]
+            ts = now.replace(microsecond=0)
+            day = ts.strftime("%Y%m%d")
             cur.execute("SELECT count(*) FROM quality_task WHERE id LIKE %s",
                         (f"QT-{day}-%",))
             task_id = f"QT-{day}-{cur.fetchone()[0] + 1:02d}"
@@ -186,10 +193,11 @@ class QualityStore:
 
     # ---- 拾取面（DP-06：外部任务行轮询拾取——M-05b 受理半边的闭环对边） ---------
 
-    def pending_tasks(self, *, now: datetime | None = None) -> list[str]:
+    def pending_tasks(self) -> list[str]:
         """拾取候选：status='running' AND step=0（M-05b 冻结语义：step=0＝待拾取外部
         任务——主平台 E2 受理落行即触发面）；FIFO（time,id 序）。管道自建行
-        （create_task→step=1）不在候选——拾取器只吃外部受理行。"""
+        （create_task→step=1）不在候选——拾取器只吃外部受理行。
+        （DP-06.fix F3：死参 now 清除——本操作无 staleness 过滤，签名不再误导。）"""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT id FROM quality_task "
                         "WHERE status='running' AND step=0 ORDER BY time, id")
@@ -204,37 +212,55 @@ class QualityStore:
                         "WHERE id=%s AND status='running' AND step=0", (task_id,))
             return cur.rowcount > 0
 
-    def heal_stale_tasks(self, *, older_than_seconds: int,
-                         now: datetime | None = None) -> list[str]:
+    def heal_stale_tasks(self, *, older_than_seconds: int) -> list[str]:
         """残行自愈（DP-06 票面二选一的**重置形**）：running∧step=1 且 time 超阈无更新
         →重置 step=0（可重拾）。不取 failed 形：0015 status CHECK('running','done')
         冻结（主仓零改动红线），failed 落不进去；重置形下中断行由拾取器收养重跑，
         复扫通道（轮询至 done）只是迟到、不造假结论。
+        钟源契约（DP-06.fix F2）：阈值比较钟＝**数据库东八区钟** now() AT TIME ZONE
+        'Asia/Shanghai'（naive，比较在 SQL 内单语句原子）——与外部受理行 time 写入口径
+        （主仓 infra.clock EAST8）及本侧 create_task 写钟同源；宿主机时区零耦合
+        （TZ≠部署时区不再使阈值整体偏移）。DP-06 rev F2 的宿主机 datetime.now() 形废除。
         单写者前提：heal+pick 仅 worker 进程单实例执行（build_scheduler 两作业同进程
         max_instances=1 串行）；多实例部署需先加租约列（DDL 冻结——挂 DP-06 疑点）。
-        time＝行创建钟（python 本地 naive——与 create_task 同钟源，DP-05 偏差 5 纪律），
-        「超阈无更新」以创建钟近似（0015 无 updated_at 列）；阈值须远大于单任务执行时长。"""
-        cutoff = (now or datetime.now()).replace(microsecond=0) - timedelta(
-            seconds=older_than_seconds)
+        time＝行创建钟（0015 无 updated_at 列），「超阈无更新」以创建钟近似；
+        阈值须远大于单任务执行时长。"""
         with self._connect() as conn, conn.cursor() as cur:
             cur.execute("UPDATE quality_task SET step=0 "
-                        "WHERE status='running' AND step=1 AND time < %s RETURNING id",
-                        (cutoff,))
+                        "WHERE status='running' AND step=1 AND "
+                        "time < (now() AT TIME ZONE 'Asia/Shanghai') "
+                        "- (%s * interval '1 second') RETURNING id",
+                        (older_than_seconds,))
             return [r[0] for r in cur.fetchall()]
 
     # ---- 隔离区 append-only（仅 INSERT——永不改写，与湖表同教义） ----------------
 
     def append_quarantine(self, rows: list[dict]) -> int:
-        """隔离行落表（batch_id+rule_no+action+loc+payload）；只插不改。"""
+        """隔离行落表（batch_id+rule_no+action+loc+payload）——**幂等写**（DP-06.fix
+        F1）：按寻址键 (batch_id, rule_no, action, loc, payload) 先查后插（单事务内，
+        照 pg_store 先查后写惯例）——同任务重执行（自愈重拾的 at-least-once 语义）
+        不再重复落同键行，报告计数×物理行数对账保持；**不同寻址键照常追加**
+        （append-only 语义不变——真坏行不吞）。append-only 教义不变：仅 INSERT 不
+        改写（读权只用于寻址比对——quality_writer.sql 的 quarantine_row SELECT
+        授权随 F1 补记；UPDATE/DELETE 仍零授权）。返回实际新插行数。"""
         if not rows:
             return 0
+        inserted = 0
         with self._connect() as conn, conn.cursor() as cur:
             for r in rows:
+                cur.execute("SELECT 1 FROM quarantine_row WHERE batch_id=%s AND rule_no=%s "
+                            "AND action=%s AND loc IS NOT DISTINCT FROM %s "
+                            "AND payload=%s::jsonb",
+                            (r["batch_id"], r["rule_no"], r["action"], r.get("loc"),
+                             _json_dumps(r["payload"])))
+                if cur.fetchone() is not None:
+                    continue
                 cur.execute("INSERT INTO quarantine_row (batch_id, rule_no, action, loc, "
                             "payload) VALUES (%s, %s, %s, %s, %s::jsonb)",
                             (r["batch_id"], r["rule_no"], r["action"], r.get("loc"),
                              _json_dumps(r["payload"])))
-        return len(rows)
+                inserted += 1
+        return inserted
 
     # ---- 水位（单调不回退） -----------------------------------------------------
 
