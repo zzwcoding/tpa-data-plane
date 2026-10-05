@@ -26,8 +26,10 @@ class UserContext:
     role: str = "engineer"
 
 
-# StructuredQuery 类型定义在 dp4（semantic.py，dp 卡钦定）；本模块只消费其形状
-# （.base_table/.tables/.metric），不 import dp4——依赖图 dp9 依赖=无。
+# StructuredQuery 类型原定义在 dp4（semantic.py，已随 ADR-0003 裁决 15 归位删除——
+# DP-02）；现逐字内联落位 audit.py，本模块只消费其形状（.base_table/.tables/.metric），
+# 不 import audit——依赖图 dp9 依赖=无。（DP-06 注记更新：原「定义在 dp4」已陈旧，
+# DP-02 审查 F5 既有项。）
 
 
 @dataclass(frozen=True)

@@ -22,7 +22,7 @@
 from __future__ import annotations
 
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from app.data_plane.transform import RULES_FULL, RuleOutcome, evaluate_bundle
 
@@ -184,6 +184,44 @@ class QualityStore:
                         "report=%s::jsonb WHERE id=%s",
                         (step, hits, _json_dumps(report), task_id))
 
+    # ---- 拾取面（DP-06：外部任务行轮询拾取——M-05b 受理半边的闭环对边） ---------
+
+    def pending_tasks(self, *, now: datetime | None = None) -> list[str]:
+        """拾取候选：status='running' AND step=0（M-05b 冻结语义：step=0＝待拾取外部
+        任务——主平台 E2 受理落行即触发面）；FIFO（time,id 序）。管道自建行
+        （create_task→step=1）不在候选——拾取器只吃外部受理行。"""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id FROM quality_task "
+                        "WHERE status='running' AND step=0 ORDER BY time, id")
+            return [r[0] for r in cur.fetchall()]
+
+    def claim_task(self, task_id: str) -> bool:
+        """原子认领闸（M-05b claim_task_followup 先例同构——条件 UPDATE 单语句）：
+        running∧step=0 → step=1（扫描执行中）。rowcount=1＝认领赢；0＝已被他者
+        认领/已完——防重复拾取（双 worker 竞态下恰单执行）。"""
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE quality_task SET step=1 "
+                        "WHERE id=%s AND status='running' AND step=0", (task_id,))
+            return cur.rowcount > 0
+
+    def heal_stale_tasks(self, *, older_than_seconds: int,
+                         now: datetime | None = None) -> list[str]:
+        """残行自愈（DP-06 票面二选一的**重置形**）：running∧step=1 且 time 超阈无更新
+        →重置 step=0（可重拾）。不取 failed 形：0015 status CHECK('running','done')
+        冻结（主仓零改动红线），failed 落不进去；重置形下中断行由拾取器收养重跑，
+        复扫通道（轮询至 done）只是迟到、不造假结论。
+        单写者前提：heal+pick 仅 worker 进程单实例执行（build_scheduler 两作业同进程
+        max_instances=1 串行）；多实例部署需先加租约列（DDL 冻结——挂 DP-06 疑点）。
+        time＝行创建钟（python 本地 naive——与 create_task 同钟源，DP-05 偏差 5 纪律），
+        「超阈无更新」以创建钟近似（0015 无 updated_at 列）；阈值须远大于单任务执行时长。"""
+        cutoff = (now or datetime.now()).replace(microsecond=0) - timedelta(
+            seconds=older_than_seconds)
+        with self._connect() as conn, conn.cursor() as cur:
+            cur.execute("UPDATE quality_task SET step=0 "
+                        "WHERE status='running' AND step=1 AND time < %s RETURNING id",
+                        (cutoff,))
+            return [r[0] for r in cur.fetchall()]
+
     # ---- 隔离区 append-only（仅 INSERT——永不改写，与湖表同教义） ----------------
 
     def append_quarantine(self, rows: list[dict]) -> int:
@@ -215,14 +253,22 @@ class QualityStore:
             return cur.rowcount > 0
 
 
-def run_quality_task(store, bundle: dict, *, scanned: dict | None = None) -> dict:
+def run_quality_task(store, bundle: dict, *, scanned: dict | None = None,
+                     task_id: str | None = None, verdict_note: str = "") -> dict:
     """质检跑批落库编排（DP-05 施工 2——质检执行体接真身，内存弃置路径清零）。
 
     流程：读启用集 → 建任务（running）→ 逐规则跑整队 → 隔离/拒收落 quarantine_row
     （告警类不产生隔离行——E2 端点 9）→ 报告 1:1 完任务（done）。返回摘要 dict
-    （worker 干跑证据载体）。"""
+    （worker 干跑证据载体）。
+
+    拾取形（DP-06——M-05b 疑点①「拾取该行而非自建」）：传 task_id＝执行**已存在的
+    外部受理行**（E2 accept_task 落的 running/step=0 行，拾取器先经 claim_task 认领
+    至 step=1），完成后 finish_task 照写 done/step=2——受理行的 rules_count/time 原
+    样不动；verdict_note＝报告头注记（报告键集不变，只续写 verdict 文案——行形合同
+    零偏差）。"""
     specs = store.enabled_rules()
-    task_id = store.create_task(rules_count=len(specs))
+    if task_id is None:
+        task_id = store.create_task(rules_count=len(specs))
     pairs = evaluate_enabled(bundle, specs)
 
     qrows: list[dict] = []
@@ -259,7 +305,8 @@ def run_quality_task(store, bundle: dict, *, scanned: dict | None = None) -> dic
         "rejected_batches": rejected_batches,      # 99 册合同键（数据粒度）
         "hits": hits_detail,                       # 命中明细（单据粒度计数见 hits 列）
         "verdict": (f"质检完成：{len(pairs)} 条启用规则，命中 {len(issue_keys)} 单，"
-                    "隔离区落行见 quarantine_row——问题单建单与责任岗分发归主平台 E2 接续"),
+                    "隔离区落行见 quarantine_row——问题单建单与责任岗分发归主平台 E2 接续"
+                    + (f"；{verdict_note}" if verdict_note else "")),
     }
     store.finish_task(task_id, hits=len(issue_keys), report=report)
     return {"task_id": task_id, "rules_run": len(pairs),

@@ -255,3 +255,85 @@ class TestRestrictedWriterAccount:
             in grant_lines
         assert not any("UPDATE" in l and "quarantine_row" in l for l in grant_lines)
         assert not any("UPDATE" in l and "quality_rule" in l for l in grant_lines)
+
+
+# ---------- DP-06：拾取器行形合同 PG 实跑（M-05b 集成替身同 DDL 对账） ----------
+
+# 行形合同冻结字面（照抄主仓 tests/domains/dataops/quality/test_quality_task_channel.py
+# 集成替身 _report()/_hit() 键集——零共享库：不 import 主仓任何代码）
+_STUB_REPORT_KEYS = {"range", "tables", "scanned_rows", "rules_run",
+                     "quarantined_rows", "rejected_batches", "hits", "verdict"}
+_STUB_HIT_KEYS = {"rule_no", "kind", "action", "hit_count", "sample"}
+
+
+class TestTaskPickup:
+    """DP-06 拾取器对真 0015 DDL 复证（hermetic 替身的 PG 半边）：
+    受理行形（M-05b 冻结：running/step=0）→ 拾取执行 → done/step=2/报告 1:1/隔离行
+    batch_id=任务号；认领闸单发；残行自愈重置可重拾。任务号用 -9x 序段（当日 LIKE
+    清场模式内，不与取号测试碰撞）。"""
+
+    def _accept(self, task_id: str, *, step: int = 0, minutes_ago: int = 0) -> None:
+        """受理行直插（主平台 E2 accept_task 的行形：running/step=0/rules_count/time）。"""
+        ts = datetime.now().replace(microsecond=0) - timedelta(minutes=minutes_ago)
+        _q("INSERT INTO quality_task (id, status, step, rules_count, time) "
+           "VALUES (%s, 'running', %s, 12, %s)", (task_id, step, ts))
+
+    def _pickup(self, store):
+        from worker.scheduler import PipelineConfig, run_pickup_once
+        cfgx = PipelineConfig(run_dir=Path("/nonexistent"), freshness=None,
+                              quality_store=store)
+        return run_pickup_once(cfgx, bundle=_bundle())
+
+    def _row(self, task_id: str):
+        rows = _q("SELECT status, step, rules_count, hits, report FROM quality_task "
+                  "WHERE id=%s", (task_id,))
+        assert len(rows) == 1
+        return rows[0]
+
+    def test_full_chain_pickup_lands_done_step2_report_one_to_one(self, store):
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-91"
+        self._accept(tid, minutes_ago=120)
+        summary = self._pickup(store)
+        assert [p["task_id"] for p in summary["picked"]] == [tid]
+        status, step, rules_count, hits, report = self._row(tid)
+        assert (status, step) == ("done", 2)                       # 行形：拾取完＝done/step=2
+        assert rules_count == 12                                   # 受理行字段不被改写
+        assert hits == summary["picked"][0]["hits"] >= 1           # hits=单据数（替身同语义）
+        assert set(report) == _STUB_REPORT_KEYS                    # 恰八键——零形状偏差
+        assert report["quarantined_rows"] == summary["picked"][0]["quarantined_rows"]
+        # 三落地同源：隔离行 batch_id=任务号；恰隔离档落行
+        qrows = _q("SELECT rule_no, action, payload FROM quarantine_row WHERE batch_id=%s",
+                   (tid,))
+        assert qrows and {r[0] for r in qrows} == {2}
+        assert all(r[1] == "隔离" and r[2]["well_id"] for r in qrows)  # 原始坏行 payload
+
+    def test_report_hits_entry_shape_matches_stub(self, store):
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-92"
+        self._accept(tid, minutes_ago=120)
+        self._pickup(store)
+        _, _, _, _, report = self._row(tid)
+        assert report["hits"]
+        for entry in report["hits"]:
+            assert set(entry) == _STUB_HIT_KEYS                    # hits 条目五键逐字段
+            assert len(entry["sample"]) <= 5                       # sample 截 5（R2 观察项）
+        assert "R2" in report["verdict"]                           # 报告头注记登记
+
+    def test_claim_gate_is_one_shot(self, store):
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-93"
+        self._accept(tid)
+        assert store.claim_task(tid) is True                       # 首认领赢（条件 UPDATE）
+        assert store.claim_task(tid) is False                      # 二次认领＝False
+        assert self._row(tid)[1] == 1                              # step=1（执行中）
+
+    def test_stale_step1_heals_and_repicks(self, store):
+        """crash 残行（step=1 超阈无更新）→自愈重置 step=0→重拾→done/step=2。"""
+        tid = f"QT-{datetime.now().strftime('%Y%m%d')}-94"
+        self._accept(tid, step=1, minutes_ago=120)                 # 认领后中断的残行
+        fresh = f"QT-{datetime.now().strftime('%Y%m%d')}-95"
+        self._accept(fresh, step=1)                                # 刚认领（在途）——不动
+        summary = self._pickup(store)
+        assert [p["task_id"] for p in summary["picked"]] == [tid]
+        assert summary["healed"] == [tid]
+        assert self._row(tid)[:2] == ("done", 2)
+        assert self._row(fresh)[1] == 1                            # 在途行不被自愈
+        assert self._row(fresh)[0] == "running"
