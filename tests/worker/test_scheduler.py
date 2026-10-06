@@ -13,11 +13,12 @@ apscheduler = pytest.importorskip("apscheduler")
 from app.data_plane.ingest import InMemoryFreshnessRegistry, Ingest
 from app.data_plane.transform import RULES_OIL_DAILY, RULES_WELL_INFO
 from tests.conftest import FakeSnapshotCatalog
+from app.data_plane.quality_store import SCAN_TABLES
 from worker.scheduler import (PipelineConfig, build_scheduler, build_trigger,
                               load_config, run_pipeline_once)
 
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "fieldforge"
-TABLES = ("oil_production_daily", "well_info")
+TABLES = ("oil_production_daily", "well_info")  # agg 两源（多测试共用的进料面简写）
 
 
 class FakeWriter:
@@ -44,7 +45,9 @@ def run_dir(tmp_path):
 def catalog():
     import io
     cat = FakeSnapshotCatalog()
-    for t in TABLES:
+    for t in SCAN_TABLES:
+        if not (FIXTURES / f"{t}.csv").is_file():
+            continue  # 缺 fixture 的表（如 water_injection_daily）由 run 目录合成例试
         with open(FIXTURES / f"{t}.csv", "rb") as f:  # 表头行嗅探（同 ingest.run_csv_load 读法）
             head = f.readline()
         names = pa.csv.read_csv(io.BytesIO(head)).column_names
@@ -240,10 +243,12 @@ class TestScanSurfaceDecoupled:
         writer = FakeWriter()
         cfgx = PipelineConfig(run_dir=run_dir8, freshness=InMemoryFreshnessRegistry(),
                               agg_writer=writer, quality_store=None,
-                              tables=("oil_production_daily", "well_info", "equip_status"))
+                              tables=("oil_production_daily", "well_info", "equip_status",
+                                      "sensor_reading_subdaily"))
         summary = run_pipeline_once(cfgx, catalog_factory=lambda: catalog)
-        assert set(summary["ingested"]) == {"oil_production_daily", "well_info"}
-        assert summary["unruled_skipped"] == ["equip_status"]      # 诚实跳过不崩
+        assert {"oil_production_daily", "well_info", "equip_status"} <= set(summary["ingested"])
+        # equip_status 规则注册后干净进料（2026-10-06 扩表）；fail-closed 覆盖保留：
+        assert summary["unruled_skipped"] == ["sensor_reading_subdaily"]  # 无规则表仍诚实跳过
         assert writer.calls                                        # 周期照常走完（agg 发生）
 
 

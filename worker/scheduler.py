@@ -137,11 +137,17 @@ def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
     from app.data_plane.ingest import (BatchRejected, Ingest, Provenance,
                                        UnruledTableRejected)
     from app.data_plane.quality_store import data_date_of, run_quality_task
-    from app.data_plane.transform import RULES_OIL_DAILY, RULES_WELL_INFO
+    from app.data_plane.transform import (RULES_EQUIP, RULES_FLUID, RULES_MEASURES,
+                                          RULES_OIL_DAILY, RULES_OVERHAUL,
+                                          RULES_SETTLE, RULES_WATER_INJ,
+                                          RULES_WELL_INFO)
 
     catalog = (catalog_factory or cfg.catalog_factory)()
     ing = Ingest(catalog=catalog, freshness=cfg.freshness, rules={
-        "oil_production_daily": RULES_OIL_DAILY, "well_info": RULES_WELL_INFO})
+        "oil_production_daily": RULES_OIL_DAILY, "well_info": RULES_WELL_INFO,
+        "water_injection_daily": RULES_WATER_INJ, "well_overhaul": RULES_OVERHAUL,
+        "equip_status": RULES_EQUIP, "fluid_test": RULES_FLUID,
+        "monthly_settlement": RULES_SETTLE, "well_measures": RULES_MEASURES})
     summary: dict = {"ingested": [], "rejected": [], "unruled_skipped": [],
                      "agg": "skipped（未配 AGG_DATABASE_URL）", "freshness": cfg.freshness}
 

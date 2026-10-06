@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 
 import pyarrow as pa
 
@@ -137,6 +138,98 @@ def _well_info_enum_rows(rows: Rows) -> list[Locator]:
 
 RULES_WELL_INFO = [QualityRule("rule-16", "枚举合法（well_info 行级半边）", "枚举合法",
                                _well_info_enum_rows)]
+
+
+# —— 进料闸规则集扩表（云部署 2026-10-06：五表＋措施台账；最小硬闸——主键列非空＋
+#    非空值域/日期序，其余脏特征留 as-is 纪律归 bundle 版规则与人工复核，不拦进料） ——
+def _not_null_gate(*cols: str):
+    def _f(rows: Rows) -> list[Locator]:
+        return [{"_index": i, **{c: r.get(c) for c in cols}}
+                for i, r in enumerate(rows) if any(r.get(c) in (None, "") for c in cols)]
+    return _f
+
+
+def _nonneg_gate(*cols: str):
+    def _f(rows: Rows) -> list[Locator]:
+        bad: list[Locator] = []
+        for i, r in enumerate(rows):
+            for c in cols:
+                v = _num(r, c)
+                if v is not None and v < 0:
+                    bad.append({"_index": i, "field": c, "value": v})
+        return bad
+    return _f
+
+
+def _band_gate(col: str, lo: float, hi: float):
+    def _f(rows: Rows) -> list[Locator]:
+        bad: list[Locator] = []
+        for i, r in enumerate(rows):
+            v = _num(r, col)
+            if v is not None and not lo <= v <= hi:
+                bad.append({"_index": i, "field": col, "value": v})
+        return bad
+    return _f
+
+
+def _iso_date(v: object):
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except (TypeError, ValueError):
+        return None
+
+
+def _end_after_start_gate(start_col: str, end_col: str):
+    def _f(rows: Rows) -> list[Locator]:
+        bad: list[Locator] = []
+        for i, r in enumerate(rows):
+            s, e = _iso_date(r.get(start_col)), _iso_date(r.get(end_col))
+            if s and e and e < s:
+                bad.append({"_index": i, "well_id": r.get("well_id"),
+                            start_col: str(s), end_col: str(e)})
+        return bad
+    return _f
+
+
+RULES_WATER_INJ = [
+    RULE_1,  # 唯一 (well_id, prod_date)——与日产同键形
+    QualityRule("rule-2", "well_id/inj_volume 非空", "完整性",
+                _not_null_gate("well_id", "inj_volume")),
+    QualityRule("rule-5", "inj_volume≥0、pump_pressure∈[0,60]", "值域",
+                lambda rows: _nonneg_gate("inj_volume")(rows)
+                + _band_gate("pump_pressure", 0, 60)(rows)),
+]
+
+RULES_OVERHAUL = [
+    QualityRule("rule-2", "well_id 非空", "完整性", _not_null_gate("well_id")),
+    QualityRule("rule-16", "检修结束不早于开始", "枚举合法",
+                _end_after_start_gate("overhaul_start", "overhaul_end")),
+]
+
+RULES_EQUIP = [
+    QualityRule("rule-2", "equip_id 非空", "完整性", _not_null_gate("equip_id")),
+    QualityRule("rule-5", "load∈[0,200]、current≥0", "值域",
+                lambda rows: _band_gate("load", 0, 200)(rows) + _nonneg_gate("current")(rows)),
+]
+
+RULES_FLUID = [
+    QualityRule("rule-2", "well_id/sample_date 非空", "完整性",
+                _not_null_gate("well_id", "sample_date")),
+    QualityRule("rule-5", "water_cut_lab∈[0,100]、density∈[0.7,1.1]", "值域",
+                lambda rows: _band_gate("water_cut_lab", 0, 100)(rows)
+                + _band_gate("density", 0.7, 1.1)(rows)),
+]
+
+RULES_SETTLE = [
+    QualityRule("rule-2", "block_name/settle_date 非空", "完整性",
+                _not_null_gate("block_name", "settle_date")),
+    QualityRule("rule-5", "net_weight≥0", "值域", _nonneg_gate("net_weight")),
+]
+
+RULES_MEASURES = [
+    QualityRule("rule-2", "well_id 非空", "完整性", _not_null_gate("well_id")),
+    QualityRule("rule-5", "incr_oil_annual≥0", "值域", _nonneg_gate("incr_oil_annual")),
+]
 
 
 def rule_mapping() -> dict[str, str]:
