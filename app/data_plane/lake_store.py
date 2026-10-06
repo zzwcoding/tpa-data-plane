@@ -333,7 +333,12 @@ class LakeCatalog:
             import boto3
         except ImportError as e:  # 已要对象存储却没装客户端：显式失败
             raise RuntimeError("LakeCatalog 需要 boto3（pip install boto3）") from e
-        return boto3.client("s3", endpoint_url=self.s3_endpoint,
+        # botocore 的 endpoint_url 必须带协议头（MINIO_ENDPOINT 两种消费方：平台侧
+        # minio SDK 吃裸 host:port，boto3 吃 http(s)://——此处统一补全，缺省 http 内网）。
+        endpoint = self.s3_endpoint or ""
+        if endpoint and not endpoint.startswith(("http://", "https://")):
+            endpoint = f"http://{endpoint}"
+        return boto3.client("s3", endpoint_url=endpoint or None,
                             aws_access_key_id=self._s3_ak, aws_secret_access_key=self._s3_sk)
 
     def ensure_bucket(self) -> None:
