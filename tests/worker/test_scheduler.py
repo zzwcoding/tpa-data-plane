@@ -1,6 +1,7 @@
 """DP-04 · 周期管道 worker 测试（APScheduler——ADR-0003 裁决 12；hermetic：替身装配）。"""
 from __future__ import annotations
 
+import io
 import shutil
 from pathlib import Path
 
@@ -152,6 +153,107 @@ class TestRunPipelineOnce:
                                     catalog_factory=lambda: catalog)
         assert "oil_production_daily" in summary["rejected"]
         assert summary["agg"].startswith("skipped")               # 无净数据不硬刷
+
+
+# ---------- V2-11：进料幂等闸（内容未变零追加；旧脏批覆写后整批重灌） ------------
+
+
+class TestIngestIdempotency:
+    """V2-11（Q11 P0 数据基座）管道幂等闸两半：
+
+    病灶（Q11 问题 1 旁证：血缘④双批次号 b-670d3a6a0d59/b-c3852fb36d75 同根）——
+    v1 残留 run 目录（28 行拟造值）被常驻 worker 每日 cron 当「新批次」反复追加，
+    湖 as-of 视图同键新批覆写真值，agg 刷新把 v1 值冲回 fct（28 行脏格＋批次号混源）。
+    修复＝①内容未变＝零追加（不建快照、不重刷 agg、不报水位、不重盖 freshness）；
+    ②视图被旧值覆写（≠源 CSV）＝整批重灌重建真值（append-only 纪律不动——
+    清历史归 dp7.expire，消费面正确性由 as-of 覆写承载）。"""
+
+    def test_second_run_zero_append(self, catalog, run_dir):
+        """同内容 CSV 连跑两遍：第二遍零变更——零新快照、agg 不重刷、零水位主张。"""
+        first = run_pipeline_once(cfg(catalog, run_dir, FakeWriter()),
+                                  catalog_factory=lambda: catalog)
+        assert set(first["ingested"]) == set(TABLES)
+        committed_after_first = list(catalog.committed)
+        w_second, store = FakeWriter(), FakeQualityStore()
+        second = run_pipeline_once(cfg(catalog, run_dir, w_second, store),
+                                   catalog_factory=lambda: catalog)
+        assert second["ingested"] == []
+        assert set(second["unchanged"]) == set(TABLES)      # 内容未变＝逐表跳过并如实记账
+        assert catalog.committed == committed_after_first   # 零新快照（湖不翻倍）
+        assert w_second.calls == []                         # 视图未动＝agg 不重刷
+        assert second["agg"].startswith("skipped")
+        assert store.water == []                            # 无落位＝无水位主张
+
+    def test_second_run_freshness_not_restamped(self, catalog, run_dir):
+        """幂等第二遍不触 freshness 登记（数据生效时刻未变＝零登记调用——
+        记账替身点数，不靠时钟分辨率）。"""
+        from app.data_plane.ingest import InMemoryFreshnessRegistry
+
+        class RecordingFreshness(InMemoryFreshnessRegistry):
+            def __init__(self):
+                super().__init__()
+                self.calls = []
+
+            def register(self, table, tier, as_of, pipeline):
+                self.calls.append((table, tier, pipeline))
+                super().register(table, tier, as_of, pipeline)
+
+        fresh = RecordingFreshness()
+        run_pipeline_once(PipelineConfig(run_dir=run_dir, freshness=fresh,
+                                         agg_writer=FakeWriter()),
+                          catalog_factory=lambda: catalog)
+        assert len(fresh.calls) == 3 + 2                           # agg 三表＋进料两表
+        fresh.calls.clear()
+        run_pipeline_once(PipelineConfig(run_dir=run_dir, freshness=fresh,
+                                         agg_writer=FakeWriter()),
+                          catalog_factory=lambda: catalog)
+        assert fresh.calls == []                                   # 零落位＝零登记
+
+    def test_stale_override_reingests_and_repairs(self, catalog, run_dir):
+        """污染修复路径：视图被旧脏批覆写（v1 残留形态）后，下一周期视图≠源 CSV
+        →整批重灌，agg 拿回真值；修完再跑恢复零变更。"""
+        run_pipeline_once(cfg(catalog, run_dir, FakeWriter()),
+                          catalog_factory=lambda: catalog)
+        rows = FIXTURES.joinpath("oil_production_daily.csv").read_text(encoding="utf-8") \
+            .splitlines()
+        header, first_data = rows[0], rows[1].split(",")
+        stale = first_data.copy()
+        stale[2] = "99.99"                                       # oil_output 换 v1 拟造值
+        stale_csv = "\n".join([header, ",".join(stale)]) + "\n"
+        names = pa.csv.read_csv(io.BytesIO(header.encode("utf-8") + b"\n")).column_names
+        catalog.begin_caller("dp2.ingest")
+        catalog.append("oil_production_daily",
+                       pa.csv.read_csv(io.BytesIO(stale_csv.encode("utf-8")),
+                                       convert_options=pa.csv.ConvertOptions(
+                                           column_types={n: pa.string() for n in names})),
+                       commit_meta={"batch_id": "b-v1residue"})
+        w_repair = FakeWriter()
+        summary = run_pipeline_once(cfg(catalog, run_dir, w_repair),
+                                    catalog_factory=lambda: catalog)
+        assert "oil_production_daily" in summary["ingested"]     # 视图≠源 → 整批重灌
+        fct = w_repair.calls[0]["fct_daily_metering"]
+        row = next(r for r in fct if r["well_id"] == first_data[0]
+                   and r["prod_date"] == first_data[1])
+        assert row["oil_output"] == float(first_data[2])         # 真值回位
+        assert row["oil_output"] != 99.99
+        again = run_pipeline_once(cfg(catalog, run_dir, FakeWriter()),
+                                  catalog_factory=lambda: catalog)
+        assert again["ingested"] == []                           # 修复后恢复幂等
+        assert set(again["unchanged"]) == set(TABLES)
+
+    def test_numeric_scale_quantization_matches_pg_landing(self):
+        """比对口径与 PG 落库定标对齐：raw 列 NUMERIC(5,1) 把 CSV 13.47 存成 13.5——
+        比对必须按列标度先定型再比（否则真湖幂等闸永不满足＝假阴性重灌）。"""
+        from worker.scheduler import _canonical_cell
+        # 同标度：CSV 文本与视图存储值（湖 _normalize 后的 float）归一到同一形态
+        assert _canonical_cell("13.47", "numeric", 1) == _canonical_cell(13.5, "numeric", 1)
+        assert _canonical_cell("21.16", "numeric", 2) == _canonical_cell(21.16, "numeric", 2)
+        # 不同标度不混比（5,1 的 13.5 ≠ 5,2 的 13.5? 同值不同形仍按数值相等——标度只服务定型）
+        assert _canonical_cell("13.47", "numeric", 1) != _canonical_cell("13.47", "numeric", 2)
+        # 无标度信息（替身湖全文本列）＝不定量，走数值等值
+        assert _canonical_cell("13.47", None, None) == _canonical_cell(13.47, None, None)
+        # 非数值列照常字符串比
+        assert _canonical_cell("B", "character varying", None) == _canonical_cell("B", None, None)
 
 
 class TestScheduleConfig:

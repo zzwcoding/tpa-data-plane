@@ -2,7 +2,10 @@
 
 - 一周期六件事：**日度进料（拉新批次）→清洗→质检跑批落库→agg 刷新→水位登记→报水位**
   （freshness 更新＋water_line 三 tier 回写）；进料走 dp2 三步契约（validate→append→
-  register，闸在编排层——脏批拒绝入湖并记 rejected）；
+  register，闸在编排层——脏批拒绝入湖并记 rejected）；**进料幂等闸（V2-11，Q11 P0
+  数据基座根因修复）**：湖 as-of 当前视图与源 CSV 逐格一致＝内容未变零追加（不建新批、
+  不重刷 agg、不报水位、不重盖 freshness——同内容重跑/每日 cron 重跑零变更；视图被
+  旧批覆写≠源＝整批重灌重建真值，修复方向宁重灌不漏灌）；
   质检＝dp3 整队跑批**落库真身**（DP-05：读 quality_rule 当前启用集→quality_task 报告
   1:1→quarantine_row 隔离落行——原 validate_bundle 内存报告弃置路径清零，报告身份＝
   QT 任务号，主平台 E2 质检台读同表同源）；报告 range 按实扫表数动态生成（DP-07 F-01）；
@@ -56,7 +59,9 @@ import csv
 import logging
 import os
 import uuid
+from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 
 log = logging.getLogger("dp.worker")
@@ -131,6 +136,53 @@ def load_config(catalog_factory=None, freshness=None, agg_writer=None,
         catalog_factory=catalog_factory)
 
 
+def _canonical_cell(v, data_type: str | None = None, scale: int | None = None):
+    """幂等比对口径（V2-11）：空值→None；数值族→Decimal（数字等值不比字面形态——
+    视图侧数值经湖 _normalize 已转 float）；**带列标度时按列形定量**（PG 落库定标口径：
+    raw 列 NUMERIC(5,1) 把 CSV 13.47 存成 13.5——比对不定量则真湖上闸永不满足＝
+    假阴性重灌）；其余→字符串。HALF_UP 与 PG numeric 舍入同向（远离零）。"""
+    if v is None or v == "":
+        return None
+    if isinstance(v, bool):
+        return str(v)
+    if data_type and data_type.split(" ")[0] in ("numeric", "decimal"):
+        d = Decimal(str(v))
+        if scale is not None:
+            d = d.quantize(Decimal(1).scaleb(-scale), rounding=ROUND_HALF_UP)
+        return d
+    return str(v)
+
+
+def _cell_canonicalizer(specs: dict):
+    """按表列形规格产出单元定型函数（无规格＝不定量——替身湖全文本列照常数值等值）。"""
+    def canon(v, col):
+        dt, sc = specs.get(col, (None, None))
+        return _canonical_cell(v, dt, sc)
+    return canon
+
+
+def view_matches_csv(catalog, table: str, csv_path: Path) -> bool:
+    """进料幂等闸判定（V2-11）：湖 as-of 当前视图与源 CSV 逐格一致（列域＝CSV 列；
+    行多重集比较——行序不敏感、A/B 班同批并列行是合法内容照常参与比对）。
+    比对口径与 PG 落库定标对齐（column_specs 数值标度定量）；替身湖无规格面＝
+    精确比。视图缺表/缺列＝不一致（走重灌——修复方向安全：宁可重灌不漏灌）。"""
+    try:
+        ref = catalog.load_table(table)
+    except KeyError:
+        return False
+    canon = _cell_canonicalizer(getattr(ref, "column_specs", dict)())
+    with open(csv_path, encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        cols = tuple(reader.fieldnames or ())
+        csv_rows = [tuple(canon(r.get(c), c) for c in cols) for r in reader]
+    view_rows = []
+    for r in ref.scan().to_pylist():  # as-of 当前视图（DP-03.fix F1）
+        if any(c not in r for c in cols):
+            return False
+        view_rows.append(tuple(canon(r.get(c), c) for c in cols))
+    return Counter(view_rows) == Counter(csv_rows)
+
+
 def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
     """一周期六件事；返回摘要（进料/质检落库/agg/水位各步如实记账——干跑证据载体）。
     扫描面＝cfg.scan_tables（F-01：全受检表），进料面＝cfg.tables（agg 两源原语义）。"""
@@ -148,8 +200,9 @@ def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
         "water_injection_daily": RULES_WATER_INJ, "well_overhaul": RULES_OVERHAUL,
         "equip_status": RULES_EQUIP, "fluid_test": RULES_FLUID,
         "monthly_settlement": RULES_SETTLE, "well_measures": RULES_MEASURES})
-    summary: dict = {"ingested": [], "rejected": [], "unruled_skipped": [],
+    summary: dict = {"ingested": [], "unchanged": [], "rejected": [], "unruled_skipped": [],
                      "agg": "skipped（未配 AGG_DATABASE_URL）", "freshness": cfg.freshness}
+    landed_any = False
 
     # 质检扫描面（F-01：与进料面解耦——全受检表；缺 CSV 诚实跳过不虚报）
     bundle: dict[str, list[dict]] = {}
@@ -179,10 +232,15 @@ def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
         if not path.is_file():
             log.info("进料跳过：run 目录无 %s（%s）", name, path)
             continue
+        if view_matches_csv(catalog, name, path):  # 幂等闸（V2-11）：内容未变零追加
+            summary["unchanged"].append(name)
+            log.info("进料跳过：%s——湖当前视图与源 CSV 逐格一致（内容未变不重灌，零新批）", name)
+            continue
         try:  # 进料闸在编排层：脏批 BatchRejected＝拒绝入湖（append 不发生）
             snap = ing.run_csv_load(name, path, Provenance(
                 quality_report_id=quality_report_id, operator=cfg.operator))
             summary["ingested"].append(name)
+            landed_any = True
             log.info("进料完成：%s → 快照 %s（as_of=%s）", name, snap.snapshot_id, snap.committed_at)
             if cfg.quality_store is not None:  # ⑥ 报水位：原始/清洗层＝闸后净批（F-03：落位批）
                 day = data_date_of(name, ing.landed.get(name) or [])
@@ -200,6 +258,11 @@ def run_pipeline_once(cfg: PipelineConfig, catalog_factory=None) -> dict:
     # ④＋⑤＋⑥ agg 刷新（限写账号直写主平台库）→ 水位登记（freshness）→ 汇总层报水位
     if cfg.agg_writer is None:
         log.warning("agg 刷新跳过：未配 AGG_DATABASE_URL（限写三表专用账号连接串）")
+        return summary
+    if not landed_any:  # 幂等闸（V2-11）：as-of 视图未动（内容未变/批被拒/无进料）＝
+        # 汇总层无从变化——不重刷、不重盖 freshness（第二遍零变更的另一半）
+        summary["agg"] = "skipped（湖无新批——as-of 视图未变，汇总层不重刷）"
+        log.info("agg 刷新跳过：本周期零落位（内容未变/批被拒/无进料）——视图未动不重刷")
         return summary
     from app.data_plane.agg import refresh_from_catalog
     counts = refresh_from_catalog(catalog, cfg.agg_writer, freshness=cfg.freshness,

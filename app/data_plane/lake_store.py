@@ -145,6 +145,18 @@ class LakeTableRef:
                           partition_spec=reg.get("partition_spec", ""),
                           current_snapshot=self._cat._current_snapshot(self.name))
 
+    def column_specs(self) -> dict[str, tuple[str, int | None]]:
+        """业务列形＋数值标度（information_schema 直读）：{列名: (data_type, numeric_scale)}。
+        消费方＝进料幂等闸（V2-11）：PG 落库按列形定标（NUMERIC(5,1) 存 13.47 为 13.5），
+        比对源 CSV 与当前视图必须同口径，否则真湖上闸永不满足（假阴性重灌）。"""
+        rows = self._cat._fetch(
+            """SELECT column_name, data_type, numeric_scale
+               FROM information_schema.columns
+               WHERE table_schema = %s AND table_name = %s ORDER BY ordinal_position""",
+            (self._cat.raw_schema, self.name))
+        return {r["column_name"]: (r["data_type"], r["numeric_scale"])
+                for r in rows if not r["column_name"].startswith("_")}
+
     def snapshots(self) -> list[SnapshotInfo]:
         return self._cat._snapshots(self.name)
 
