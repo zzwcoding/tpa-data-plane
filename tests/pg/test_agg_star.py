@@ -21,6 +21,7 @@ from app.data_plane.agg import AggStarWriter, refresh_from_catalog
 from app.data_plane.ingest import Ingest, Provenance
 from app.data_plane.lake_store import load_catalog
 from app.data_plane.transform import RULES_OIL_DAILY, RULES_WELL_INFO
+from tests.conftest import dsn_database_name
 
 TEST_DSN = os.environ.get("TEST_DATABASE_URL")
 ENDPOINT = os.environ.get("TEST_MINIO_ENDPOINT", "http://localhost:9000")
@@ -182,8 +183,10 @@ class TestRestrictedWriterAccount:
                              if not l.strip().startswith("--")).strip()
             if stmt:
                 _q(stmt)
-        yield "postgresql://tpa_agg_writer:dp4-probe-pw@%s/petro" % (
-            TEST_DSN.split("@")[1].split("/")[0],)
+        # 库名从 TEST_DSN 派生（V2-21）：硬编码 /petro＝误指残留——守卫放行 petro_test
+        # 后两值分家即假红；限写账号探针必须与被测库同库
+        yield "postgresql://tpa_agg_writer:dp4-probe-pw@%s/%s" % (
+            TEST_DSN.split("@")[1].split("/")[0], dsn_database_name(TEST_DSN))
         _drop_writer_role()
 
     def _denied(self, dsn, sql, params=()):

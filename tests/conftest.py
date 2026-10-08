@@ -6,17 +6,70 @@ DP-03 后湖真身=LakeCatalog（PG raw schema＋MinIO，tests/dp1 实跑）；�
 语义对齐真身：写面白名单／as-of 时点视图快照隔离（DP-03.fix F1：每业务键取最新批生效版，
 未登记业务键的表=纯时点累积；键口径共用 lake_store._BUSINESS_KEYS——替身/真身一致断言在
 tests/dp1 TestAsOfTimepointView）／expire 只清时间旅行可见性／committed_at=真时钟。
+
+V2-21 增设集成套防误指机闸（P-011 重大事件防线）：PG 集成套每用例 DROP 重建真身表，
+TEST_DATABASE_URL 一旦误指共享 dev 库即不可逆删库——套件入口（pytest_configure）校验
+DSN 库名，非白名单测试库名即 UsageError 拒启动（退出码说话）；未设该变量不校验
+（hermetic 套件不受影响，PG 集成照常 skip）。机闸测试在 tests/test_db_guard.py。
 """
 from __future__ import annotations
 
+import os
 from datetime import datetime
+from urllib.parse import unquote, urlsplit
 
 import pyarrow as pa
+import pytest
 
 from app.data_plane.lake_store import (BoundaryViolation, SnapshotGoneError, SnapshotInfo,
                                        _BUSINESS_KEYS)
 
 _WRITE_ALLOWED = ("dp2.ingest", "dp3.transform")
+
+# V2-21：允许跑 PG 集成套的测试库白名单（专用测试库，丢了可重建）——
+# 共享 dev 库（compose petro）等非测试库一律拒。扩名单=改这里（评审面）。
+_ALLOWED_TEST_DBS = frozenset({"petro_test"})
+
+
+def dsn_database_name(dsn: str) -> str:
+    """从 DSN 提取库名（URL 形与 keyword=value 形都吃）；解析不出返回空串。
+
+    纯解析不连库（守卫在启动期跑，不依赖 psycopg 在场）。
+    """
+    dsn = (dsn or "").strip()
+    if not dsn:
+        return ""
+    if "://" in dsn:  # URL 形：postgresql://user:pass@host:port/dbname?args
+        path = urlsplit(dsn).path
+        return unquote(path.lstrip("/").split("/", 1)[0])
+    for part in dsn.split():  # keyword=value 形：libpq 关键字 dbname（收 database= 别名）
+        key, _, value = part.partition("=")
+        if key in ("dbname", "database") and value:
+            return value.strip("'\"")
+    return ""
+
+
+def guard_test_database_url() -> None:
+    """V2-21 防误指机闸：TEST_DATABASE_URL 库名不在测试库白名单即 UsageError 拒启动。
+
+    fail-closed：设了 TEST_DATABASE_URL 却解析不出库名，同样拒。
+    """
+    dsn = os.environ.get("TEST_DATABASE_URL")
+    if not dsn:
+        return
+    name = dsn_database_name(dsn)
+    if name not in _ALLOWED_TEST_DBS:
+        raise pytest.UsageError(
+            "TEST_DATABASE_URL 防误指机闸（V2-21/P-011 重大事件防线）："
+            f"DSN {dsn!r} 的库名为 {name or '<解析不出>'!r}，"
+            f"不在测试库白名单 {sorted(_ALLOWED_TEST_DBS)}——拒绝启动。"
+            "PG 集成套会对库内表做 DROP 重建，误指共享 dev 库＝不可逆删库；"
+            "请把 TEST_DATABASE_URL 指向专用测试库"
+            "（如 postgresql://…:5433/petro_test）。")
+
+
+def pytest_configure(config):
+    guard_test_database_url()
 
 
 def pytest_collection_modifyitems(items):

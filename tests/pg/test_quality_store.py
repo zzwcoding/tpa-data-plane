@@ -23,6 +23,7 @@ psycopg = pytest.importorskip("psycopg")
 
 from app.data_plane import quality_store as quality_store_mod
 from app.data_plane.quality_store import QualityStore, data_date_of, run_quality_task
+from tests.conftest import dsn_database_name
 
 TEST_DSN = os.environ.get("TEST_DATABASE_URL")
 FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "fieldforge"
@@ -186,8 +187,10 @@ class TestRestrictedWriterAccount:
                              if not l.strip().startswith("--")).strip()
             if stmt:
                 _q(stmt)
-        yield "postgresql://tpa_quality_writer:dp5-probe-pw@%s/petro" % (
-            TEST_DSN.split("@")[1].split("/")[0],)
+        # 库名从 TEST_DSN 派生（V2-21）：硬编码 /petro＝误指残留——守卫放行 petro_test
+        # 后两值分家即假红；限写账号探针必须与被测库同库
+        yield "postgresql://tpa_quality_writer:dp5-probe-pw@%s/%s" % (
+            TEST_DSN.split("@")[1].split("/")[0], dsn_database_name(TEST_DSN))
         self._drop_role()
 
     @staticmethod
